@@ -41,7 +41,8 @@ class TranslateManager {
         return try {
             translator.translate(trimmedText).await()
         } catch (e: Exception) {
-            null
+            DebugStore.logError(e)
+            throw e
         }
     }
 

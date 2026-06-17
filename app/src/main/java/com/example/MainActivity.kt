@@ -16,6 +16,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -126,8 +131,8 @@ class MainActivity : ComponentActivity() {
                     NavigationBarItem(
                         selected = selectedTab == 3,
                         onClick = { selectedTab = 3 },
-                        icon = { Icon(Icons.Default.Folder, contentDescription = "Model") },
-                        label = { Text("Model") }
+                        icon = { Icon(Icons.Default.BugReport, contentDescription = "Debug") },
+                        label = { Text("Debug") }
                     )
                 }
             }
@@ -334,8 +339,93 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }
+                    } else if (selectedTab == 3) {
+                        DiagnosticPanel()
                     }
                 }
+            }
+        }
+    }
+
+    @Composable
+    fun DiagnosticPanel() {
+        val captureStatus by DebugStore.captureStatus
+        val bitmapCaptured by DebugStore.bitmapCaptured
+        val lastBitmap by DebugStore.lastBitmap
+        val ocrRawText by DebugStore.ocrRawText
+        val ocrTextLength by DebugStore.ocrTextLength
+        val translationResult by DebugStore.translationResult
+        val serviceState by DebugStore.serviceState
+        val ocrOverlayState by DebugStore.ocrOverlayState
+        val lastError by DebugStore.lastError
+        val detectedBlocks by DebugStore.detectedBlocks
+        val detectedLines by DebugStore.detectedLines
+        val selX by DebugStore.selectedAreaX
+        val selY by DebugStore.selectedAreaY
+        val selW by DebugStore.selectedAreaW
+        val selH by DebugStore.selectedAreaH
+        val enableTrans = DebugStore.enableTranslation.value
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+        ) {
+            Text("System Diagnostics", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("Enable Translation (Disable for OCR Test)", color = Color.White, modifier = Modifier.weight(1f))
+                Switch(
+                    checked = enableTrans,
+                    onCheckedChange = { DebugStore.enableTranslation.value = it }
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+
+            DiagnosticCard("Service State", serviceState)
+            DiagnosticCard("Overlay Mode", ocrOverlayState)
+            DiagnosticCard("Screen Capture", captureStatus)
+            DiagnosticCard("Bitmap Captured", if (bitmapCaptured) "YES" else "NO")
+            DiagnosticCard("OCR Result", if (ocrRawText.isNotBlank()) ocrRawText else "NO_TEXT")
+            DiagnosticCard("OCR Text Length", "$ocrTextLength characters")
+            DiagnosticCard("Detected Blocks/Lines", "$detectedBlocks Blocks, $detectedLines Lines")
+            DiagnosticCard("Translation Result", if (translationResult.isNotBlank()) translationResult else "NO_RESULT")
+            
+            Spacer(modifier = Modifier.height(8.dp))
+            DiagnosticCard("Selected Area", "X:$selX Y:$selY W:$selW H:$selH")
+
+            if (lastError.isNotBlank()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0x33FF0000)), modifier = Modifier.fillMaxWidth()) {
+                    Text("Last Error:\n$lastError", color = Color.Red, fontSize = 12.sp, modifier = Modifier.padding(8.dp))
+                }
+            }
+
+            if (lastBitmap != null) {
+                Spacer(modifier = Modifier.height(16.dp))
+                Text("Last Captured Bitmap:", color = Color.LightGray, fontSize = 14.sp)
+                Spacer(modifier = Modifier.height(8.dp))
+                Image(
+                    bitmap = lastBitmap!!.asImageBitmap(),
+                    contentDescription = "Last captured screenshot",
+                    modifier = Modifier.fillMaxWidth().height(200.dp).background(Color.Black)
+                )
+            }
+            Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+
+    @Composable
+    fun DiagnosticCard(label: String, value: String) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape = RoundedCornerShape(8.dp),
+            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+        ) {
+            Row(modifier = Modifier.padding(12.dp).fillMaxWidth()) {
+                Text(label, color = Color.LightGray, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                Text(value, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             }
         }
     }

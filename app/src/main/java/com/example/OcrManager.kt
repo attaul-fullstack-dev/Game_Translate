@@ -13,10 +13,17 @@ class OcrManager {
         val image = InputImage.fromBitmap(bitmap, 0)
         return try {
             val result = recognizer.process(image).await()
-            // If confidence isn't available easily, we just use the raw text.
+            DebugStore.detectedBlocks.value = result.textBlocks.size
+            var lines = 0
+            for (block in result.textBlocks) {
+                lines += block.lines.size
+            }
+            DebugStore.detectedLines.value = lines
+            
             result.text
         } catch (e: Exception) {
-            ""
+            DebugStore.logError(e)
+            throw e
         }
     }
 

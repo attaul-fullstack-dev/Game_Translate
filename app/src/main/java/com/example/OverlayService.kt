@@ -33,6 +33,7 @@ class OverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        DebugStore.serviceState.value = "STARTING"
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         screenCaptureManager = ScreenCaptureManager(this)
         ocrManager = OcrManager()
@@ -42,6 +43,7 @@ class OverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        DebugStore.serviceState.value = "RUNNING"
         val notification = createNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
@@ -185,25 +187,55 @@ class OverlayService : Service() {
                             val h = area[3]
 
                             if (w > 0 && h > 0) {
+                                DebugStore.ocrOverlayState.value = "ACTIVE"
+                                DebugStore.selectedAreaX.value = x
+                                DebugStore.selectedAreaY.value = y
+                                DebugStore.selectedAreaW.value = w
+                                DebugStore.selectedAreaH.value = h
+
+                                DebugStore.captureStatus.value = "CAPTURING..."
                                 val bitmap = screenCaptureManager.captureRect(x, y, w, h)
                                 if (bitmap != null) {
+                                    DebugStore.captureStatus.value = "OK"
+                                    DebugStore.bitmapCaptured.value = true
+                                    DebugStore.lastBitmap.value = bitmap
+
                                     val text = ocrManager.extractText(bitmap)
+                                    DebugStore.ocrRawText.value = text
+                                    DebugStore.ocrTextLength.value = text.length
+
                                     if (text.isNotBlank()) {
-                                        val translated = translateManager.translate(text)
-                                        if (!translated.isNullOrBlank()) {
-                                            withContext(Dispatchers.Main) {
-                                                translationOverlayView?.setText(translated)
+                                        if (DebugStore.enableTranslation.value) {
+                                            val translated = translateManager.translate(text)
+                                            DebugStore.translationResult.value = translated ?: "NULL"
+
+                                            if (!translated.isNullOrBlank()) {
+                                                withContext(Dispatchers.Main) {
+                                                    translationOverlayView?.setText(translated)
+                                                }
+                                            } else {
+                                                withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
                                             }
                                         } else {
-                                            withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
+                                            DebugStore.translationResult.value = "SKIPPED (OCR ONLY)"
+                                            withContext(Dispatchers.Main) {
+                                                translationOverlayView?.setText(text)
+                                            }
                                         }
                                     } else {
+                                        DebugStore.translationResult.value = ""
                                         withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
                                     }
+                                } else {
+                                    DebugStore.captureStatus.value = "FAIL"
+                                    DebugStore.bitmapCaptured.value = false
                                 }
                             }
                         } catch (e: Exception) {
+                            DebugStore.logError(e)
                             e.printStackTrace()
+                            // If we want to not swallow, we could throw here, but that crashes the background loop and the app. 
+                            // So just logging in debug store is enough.
                         }
                     }
                 } else {
@@ -216,6 +248,7 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        DebugStore.serviceState.value = "STOPPED"
         captureJob?.cancel()
         scope.cancel()
         
