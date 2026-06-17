@@ -20,14 +20,14 @@ class OverlayService : Service() {
     private lateinit var screenCaptureManager: ScreenCaptureManager
     private lateinit var ocrManager: OcrManager
     private lateinit var translateManager: TranslateManager
-    
+
     private var rectangleSelectorView: RectangleSelectorView? = null
     private var translationOverlayView: TranslationOverlayView? = null
     private var controlBarView: ControlBarView? = null
-    
+
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private var captureJob: Job? = null
-    
+
     private var currentState = OverlayState.IDLE
     private var selectedArea: IntArray? = null
 
@@ -38,7 +38,6 @@ class OverlayService : Service() {
         screenCaptureManager = ScreenCaptureManager(this)
         ocrManager = OcrManager()
         translateManager = TranslateManager()
-        
         createNotificationChannel()
     }
 
@@ -70,6 +69,7 @@ class OverlayService : Service() {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
+            @Suppress("DEPRECATION")
             WindowManager.LayoutParams.TYPE_PHONE
         }
     }
@@ -104,9 +104,7 @@ class OverlayService : Service() {
                 currentState = OverlayState.ACTIVE
                 controlBarView?.updateState(currentState)
             }
-            OverlayState.SELECTING -> {
-                cancelSelectionMode()
-            }
+            OverlayState.SELECTING -> cancelSelectionMode()
         }
     }
 
@@ -114,23 +112,29 @@ class OverlayService : Service() {
         currentState = OverlayState.SELECTING
         controlBarView?.updateState(currentState)
 
-        rectangleSelectorView = RectangleSelectorView(this, windowManager,
+        rectangleSelectorView = RectangleSelectorView(
+            context = this,
+            windowManager = windowManager,
             onConfirm = { x, y, w, h ->
                 selectedArea = intArrayOf(x, y, w, h)
+
+                DebugStore.selectedAreaX.value = x
+                DebugStore.selectedAreaY.value = y
+                DebugStore.selectedAreaW.value = w
+                DebugStore.selectedAreaH.value = h
+
                 rectangleSelectorView?.let { windowManager.removeView(it) }
                 rectangleSelectorView = null
-                
+
                 setupTranslationOverlay(x, y, w, h)
-                
+
                 currentState = OverlayState.ACTIVE
                 controlBarView?.updateState(currentState)
                 startCaptureLoop()
             },
-            onCancel = {
-                cancelSelectionMode()
-            }
+            onCancel = { cancelSelectionMode() }
         )
-        
+
         val rectParams = WindowManager.LayoutParams(
             800, 300,
             getLayoutFlag(),
@@ -146,20 +150,16 @@ class OverlayService : Service() {
     private fun cancelSelectionMode() {
         rectangleSelectorView?.let { windowManager.removeView(it) }
         rectangleSelectorView = null
-        if (selectedArea != null) {
-            currentState = OverlayState.PAUSED
-        } else {
-            currentState = OverlayState.IDLE
-        }
+        currentState = if (selectedArea != null) OverlayState.PAUSED else OverlayState.IDLE
         controlBarView?.updateState(currentState)
     }
 
     private fun setupTranslationOverlay(x: Int, y: Int, w: Int, h: Int) {
         translationOverlayView?.let { windowManager.removeView(it) }
-        
         translationOverlayView = TranslationOverlayView(this)
+
         val transParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            w,
             WindowManager.LayoutParams.WRAP_CONTENT,
             getLayoutFlag(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
@@ -167,81 +167,72 @@ class OverlayService : Service() {
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             this.x = x
-            this.y = y // overlap text directly
+            this.y = y
         }
         windowManager.addView(translationOverlayView, transParams)
     }
 
     private fun startCaptureLoop() {
         if (captureJob?.isActive == true) return
-        
+
         captureJob = scope.launch(Dispatchers.Default) {
+            // Beri waktu user pindah ke game
+            delay(2000)
+
             while (isActive) {
                 if (currentState == OverlayState.ACTIVE) {
                     val area = selectedArea
-                    if (area != null) {
+                    if (area != null && area[2] > 0 && area[3] > 0) {
                         try {
                             val x = area[0]
                             val y = area[1]
                             val w = area[2]
                             val h = area[3]
 
-                            if (w > 0 && h > 0) {
-                                DebugStore.ocrOverlayState.value = "ACTIVE"
-                                DebugStore.selectedAreaX.value = x
-                                DebugStore.selectedAreaY.value = y
-                                DebugStore.selectedAreaW.value = w
-                                DebugStore.selectedAreaH.value = h
+                            DebugStore.captureStatus.value = "CAPTURING..."
+                            val bitmap = screenCaptureManager.captureRect(x, y, w, h)
 
-                                DebugStore.captureStatus.value = "CAPTURING..."
-                                val bitmap = screenCaptureManager.captureRect(x, y, w, h)
-                                if (bitmap != null) {
-                                    DebugStore.captureStatus.value = "OK"
-                                    DebugStore.bitmapCaptured.value = true
-                                    DebugStore.lastBitmap.value = bitmap
+                            if (bitmap != null) {
+                                DebugStore.captureStatus.value = "OK"
+                                DebugStore.bitmapCaptured.value = true
+                                DebugStore.lastBitmap.value = bitmap
 
-                                    val text = ocrManager.extractText(bitmap)
-                                    DebugStore.ocrRawText.value = text
-                                    DebugStore.ocrTextLength.value = text.length
+                                val text = ocrManager.extractText(bitmap)
+                                DebugStore.ocrRawText.value = text
+                                DebugStore.ocrTextLength.value = text.length
 
-                                    if (text.isNotBlank()) {
-                                        if (DebugStore.enableTranslation.value) {
-                                            val translated = translateManager.translate(text)
-                                            DebugStore.translationResult.value = translated ?: "NULL"
-
-                                            if (!translated.isNullOrBlank()) {
-                                                withContext(Dispatchers.Main) {
-                                                    translationOverlayView?.setText(translated)
-                                                }
-                                            } else {
-                                                withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
-                                            }
-                                        } else {
-                                            DebugStore.translationResult.value = "SKIPPED (OCR ONLY)"
-                                            withContext(Dispatchers.Main) {
-                                                translationOverlayView?.setText(text)
-                                            }
+                                if (text.isNotBlank()) {
+                                    if (DebugStore.enableTranslation.value) {
+                                        val translated = translateManager.translate(text)
+                                        DebugStore.translationResult.value = translated ?: "NULL"
+                                        withContext(Dispatchers.Main) {
+                                            translationOverlayView?.setText(
+                                                if (!translated.isNullOrBlank()) translated else ""
+                                            )
                                         }
                                     } else {
-                                        DebugStore.translationResult.value = ""
-                                        withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
+                                        DebugStore.translationResult.value = "SKIPPED (OCR ONLY)"
+                                        withContext(Dispatchers.Main) {
+                                            translationOverlayView?.setText(text)
+                                        }
                                     }
                                 } else {
-                                    DebugStore.captureStatus.value = "FAIL"
-                                    DebugStore.bitmapCaptured.value = false
+                                    DebugStore.translationResult.value = ""
+                                    withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
                                 }
+                            } else {
+                                DebugStore.captureStatus.value = "FAIL"
+                                DebugStore.bitmapCaptured.value = false
                             }
                         } catch (e: Exception) {
                             DebugStore.logError(e)
                             e.printStackTrace()
-                            // If we want to not swallow, we could throw here, but that crashes the background loop and the app. 
-                            // So just logging in debug store is enough.
                         }
                     }
                 } else {
                     withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
                 }
-                delay(1000)
+                delay(1500)
             }
         }
     }
@@ -251,11 +242,11 @@ class OverlayService : Service() {
         DebugStore.serviceState.value = "STOPPED"
         captureJob?.cancel()
         scope.cancel()
-        
+
         rectangleSelectorView?.let { windowManager.removeView(it) }
         translationOverlayView?.let { windowManager.removeView(it) }
         controlBarView?.let { windowManager.removeView(it) }
-        
+
         screenCaptureManager.stop()
         ocrManager.close()
         translateManager.close()
