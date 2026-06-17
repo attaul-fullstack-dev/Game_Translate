@@ -1,0 +1,6 @@
+{
+  "name": "Game Translator",
+  "description": "Real-time game translator using OCR and ML Kit.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
