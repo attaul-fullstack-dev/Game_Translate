@@ -26,6 +26,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
 
@@ -66,18 +67,21 @@ class MainActivity : ComponentActivity() {
         var isDownloading by remember { mutableStateOf(false) }
 
         LaunchedEffect(Unit) {
-            hasOverlayPerm = PermissionHelper.hasOverlayPermission(this@MainActivity)
-            isModelDownloaded = translateManager.isModelDownloaded()
-            if (!isModelDownloaded && !isDownloading && hasOverlayPerm) {
-                 isDownloading = true
-                 try {
-                     translateManager.downloadModelsIfNeeded()
-                     isModelDownloaded = true
-                 } catch (e: Exception) {
-                     // ignore silently on auto download
-                 } finally {
-                     isDownloading = false
-                 }
+            while (true) {
+                hasOverlayPerm = PermissionHelper.hasOverlayPermission(this@MainActivity)
+                isModelDownloaded = translateManager.isModelDownloaded()
+                if (!isModelDownloaded && !isDownloading && hasOverlayPerm) {
+                     isDownloading = true
+                     try {
+                         translateManager.downloadModelsIfNeeded()
+                         isModelDownloaded = true
+                     } catch (e: Exception) {
+                         // ignore silently on auto download
+                     } finally {
+                         isDownloading = false
+                     }
+                }
+                delay(2000)
             }
         }
 
@@ -237,7 +241,7 @@ class MainActivity : ComponentActivity() {
                             ModelItem(
                                 name = "Inggris",
                                 desc = "Model Bahasa Inggris",
-                                size = "1.18 GB",
+                                size = "~31 MB",
                                 isReady = isModelDownloaded
                             )
                             
@@ -247,7 +251,7 @@ class MainActivity : ComponentActivity() {
                             ModelItem(
                                 name = "Indonesia",
                                 desc = "Model Bahasa Indonesia",
-                                size = "1.23 GB",
+                                size = "~31 MB",
                                 isReady = isModelDownloaded
                             )
                         }

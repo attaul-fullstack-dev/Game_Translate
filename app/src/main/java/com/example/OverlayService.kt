@@ -28,7 +28,7 @@ class OverlayService : Service() {
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private var captureJob: Job? = null
     
-    private var isPaused = false
+    private var currentState = OverlayState.IDLE
     private var selectedArea: IntArray? = null
 
     override fun onCreate() {
@@ -58,76 +58,28 @@ class OverlayService : Service() {
 
             if (data != null) {
                 screenCaptureManager.start(resultCode, data, width, height, density)
-                setupSelectionMode()
+                setupControlBar()
             }
         }
         return START_NOT_STICKY
     }
 
-    private fun setupSelectionMode() {
-        val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+    private fun getLayoutFlag(): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
             WindowManager.LayoutParams.TYPE_PHONE
         }
-
-        rectangleSelectorView = RectangleSelectorView(this, windowManager,
-            onConfirm = { x, y, w, h ->
-                // Switch to active Mode
-                selectedArea = intArrayOf(x, y, w, h)
-                rectangleSelectorView?.let { windowManager.removeView(it) }
-                rectangleSelectorView = null
-                
-                setupActiveMode(x, y, w, h, layoutFlag)
-                startCaptureLoop()
-            },
-            onCancel = {
-                stopSelf()
-            }
-        )
-        
-        val rectParams = WindowManager.LayoutParams(
-            800, 300,
-            layoutFlag,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.CENTER
-        }
-        rectangleSelectorView?.params = rectParams
-        windowManager.addView(rectangleSelectorView, rectParams)
     }
 
-    private fun setupActiveMode(x: Int, y: Int, w: Int, h: Int, layoutFlag: Int) {
-        // Translation Overlay directly over or near the text
-        translationOverlayView = TranslationOverlayView(this)
-        val transParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            layoutFlag,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            this.x = x
-            this.y = y // overlap text directly
+    private fun setupControlBar() {
+        controlBarView = ControlBarView(this, windowManager) {
+            handleBubbleTap()
         }
-        windowManager.addView(translationOverlayView, transParams)
-
-        // Control Bar (Floating circular button)
-        controlBarView = ControlBarView(this, windowManager, 
-            onPauseResume = { paused -> 
-                isPaused = paused 
-                if (paused) {
-                    translationOverlayView?.setText("")
-                }
-            },
-            onStop = { stopSelf() }
-        )
         val controlParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            layoutFlag,
+            getLayoutFlag(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         ).apply {
@@ -138,10 +90,92 @@ class OverlayService : Service() {
         windowManager.addView(controlBarView, controlParams)
     }
 
+    private fun handleBubbleTap() {
+        when (currentState) {
+            OverlayState.IDLE -> startSelectionMode()
+            OverlayState.ACTIVE -> {
+                currentState = OverlayState.PAUSED
+                controlBarView?.updateState(currentState)
+                translationOverlayView?.setText("")
+            }
+            OverlayState.PAUSED -> {
+                currentState = OverlayState.ACTIVE
+                controlBarView?.updateState(currentState)
+            }
+            OverlayState.SELECTING -> {
+                cancelSelectionMode()
+            }
+        }
+    }
+
+    private fun startSelectionMode() {
+        currentState = OverlayState.SELECTING
+        controlBarView?.updateState(currentState)
+
+        rectangleSelectorView = RectangleSelectorView(this, windowManager,
+            onConfirm = { x, y, w, h ->
+                selectedArea = intArrayOf(x, y, w, h)
+                rectangleSelectorView?.let { windowManager.removeView(it) }
+                rectangleSelectorView = null
+                
+                setupTranslationOverlay(x, y, w, h)
+                
+                currentState = OverlayState.ACTIVE
+                controlBarView?.updateState(currentState)
+                startCaptureLoop()
+            },
+            onCancel = {
+                cancelSelectionMode()
+            }
+        )
+        
+        val rectParams = WindowManager.LayoutParams(
+            800, 300,
+            getLayoutFlag(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.CENTER
+        }
+        rectangleSelectorView?.params = rectParams
+        windowManager.addView(rectangleSelectorView, rectParams)
+    }
+
+    private fun cancelSelectionMode() {
+        rectangleSelectorView?.let { windowManager.removeView(it) }
+        rectangleSelectorView = null
+        if (selectedArea != null) {
+            currentState = OverlayState.PAUSED
+        } else {
+            currentState = OverlayState.IDLE
+        }
+        controlBarView?.updateState(currentState)
+    }
+
+    private fun setupTranslationOverlay(x: Int, y: Int, w: Int, h: Int) {
+        translationOverlayView?.let { windowManager.removeView(it) }
+        
+        translationOverlayView = TranslationOverlayView(this)
+        val transParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            getLayoutFlag(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            this.x = x
+            this.y = y // overlap text directly
+        }
+        windowManager.addView(translationOverlayView, transParams)
+    }
+
     private fun startCaptureLoop() {
+        if (captureJob?.isActive == true) return
+        
         captureJob = scope.launch(Dispatchers.Default) {
             while (isActive) {
-                if (!isPaused) {
+                if (currentState == OverlayState.ACTIVE) {
                     val area = selectedArea
                     if (area != null) {
                         try {
@@ -172,6 +206,8 @@ class OverlayService : Service() {
                             e.printStackTrace()
                         }
                     }
+                } else {
+                    withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
                 }
                 delay(1000)
             }
