@@ -18,6 +18,13 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
+      - name: Generate Debug Keystore
+        run: |
+          keytool -genkey -v -keystore debug.keystore \
+            -alias androiddebugkey -storepass android -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "C=US, O=Android, CN=Android Debug"
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
