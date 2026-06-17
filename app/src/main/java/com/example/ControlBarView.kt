@@ -4,24 +4,36 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.view.MotionEvent
 import android.view.WindowManager
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
 import android.widget.FrameLayout
-import androidx.compose.ui.res.painterResource
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
 import androidx.lifecycle.setViewTreeLifecycleOwner
+import androidx.savedstate.SavedStateRegistry
+import androidx.savedstate.SavedStateRegistryController
+import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 
 @SuppressLint("ViewConstructor", "ClickableViewAccessibility")
@@ -32,6 +44,7 @@ class ControlBarView(
     onStop: () -> Unit
 ) : FrameLayout(context) {
 
+    private var isExpanded = mutableStateOf(false)
     private var isPaused = mutableStateOf(false)
     var params: WindowManager.LayoutParams? = null
     
@@ -53,39 +66,76 @@ class ControlBarView(
 
         val composeView = ComposeView(context).apply {
             setContent {
+                val expanded by isExpanded
                 val paused by isPaused
                 
-                Box(
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(Color(0xFF1A1A2E))
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .clip(RoundedCornerShape(32.dp))
+                        .background(Color(0xE61A1A2E))
+                        .padding(4.dp)
                 ) {
-                    Row {
-                        IconButton(onClick = { 
-                            isPaused.value = !paused 
-                            onPauseResume(isPaused.value)
-                        }) {
-                            if (paused) {
-                                Icon(
-                                    imageVector = Icons.Default.PlayArrow,
-                                    contentDescription = "Resume",
-                                    tint = Color.White
-                                )
-                            } else {
-                                Icon(
-                                    painter = painterResource(android.R.drawable.ic_media_pause),
-                                    contentDescription = "Pause",
-                                    tint = Color.White
-                                )
+                    // Main translate button
+                    Box(
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(Color.White)
+                            .clickable {
+                                isExpanded.value = !expanded
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Translate,
+                            contentDescription = "Menu",
+                            tint = Color(0xFFA855F7)
+                        )
+                    }
+
+                    AnimatedVisibility(
+                        visible = expanded,
+                        enter = expandHorizontally(animationSpec = tween(200)),
+                        exit = shrinkHorizontally(animationSpec = tween(200))
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(start = 8.dp, end = 4.dp)
+                        ) {
+                            // Check button (Resume / Show overlay)
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(CircleShape)
+                                    .background(if (!paused) Color.Green else Color.DarkGray)
+                                    .clickable {
+                                        isPaused.value = false
+                                        onPauseResume(false)
+                                        isExpanded.value = false
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.Check, contentDescription = "Active", tint = Color.White)
                             }
-                        }
-                        IconButton(onClick = { onStop() }) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "Stop",
-                                tint = Color.Red
-                            )
+                            
+                            Spacer(modifier = Modifier.width(8.dp))
+                            
+                            // Cross button (Pause / Stop overlay temporarily, or close)
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(CircleShape)
+                                    .background(Color.Red)
+                                    .clickable {
+                                        isPaused.value = true
+                                        onPauseResume(true)
+                                        isExpanded.value = false
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = "Inactive", tint = Color.White)
+                            }
                         }
                     }
                 }

@@ -29,6 +29,7 @@ class OverlayService : Service() {
     private var captureJob: Job? = null
     
     private var isPaused = false
+    private var selectedArea: IntArray? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -57,22 +58,34 @@ class OverlayService : Service() {
 
             if (data != null) {
                 screenCaptureManager.start(resultCode, data, width, height, density)
-                setupViews()
-                startCaptureLoop()
+                setupSelectionMode()
             }
         }
         return START_NOT_STICKY
     }
 
-    private fun setupViews() {
+    private fun setupSelectionMode() {
         val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
-        // 1. Rectangle Selector
-        rectangleSelectorView = RectangleSelectorView(this, windowManager)
+        rectangleSelectorView = RectangleSelectorView(this, windowManager,
+            onConfirm = { x, y, w, h ->
+                // Switch to active Mode
+                selectedArea = intArrayOf(x, y, w, h)
+                rectangleSelectorView?.let { windowManager.removeView(it) }
+                rectangleSelectorView = null
+                
+                setupActiveMode(x, y, w, h, layoutFlag)
+                startCaptureLoop()
+            },
+            onCancel = {
+                stopSelf()
+            }
+        )
+        
         val rectParams = WindowManager.LayoutParams(
             800, 300,
             layoutFlag,
@@ -83,24 +96,32 @@ class OverlayService : Service() {
         }
         rectangleSelectorView?.params = rectParams
         windowManager.addView(rectangleSelectorView, rectParams)
+    }
 
-        // 2. Translation Overlay
+    private fun setupActiveMode(x: Int, y: Int, w: Int, h: Int, layoutFlag: Int) {
+        // Translation Overlay directly over or near the text
         translationOverlayView = TranslationOverlayView(this)
         val transParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             layoutFlag,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = 300 // Offset from bottom
+            gravity = Gravity.TOP or Gravity.START
+            this.x = x
+            this.y = y // overlap text directly
         }
         windowManager.addView(translationOverlayView, transParams)
 
-        // 3. Control Bar
+        // Control Bar (Floating circular button)
         controlBarView = ControlBarView(this, windowManager, 
-            onPauseResume = { paused -> isPaused = paused },
+            onPauseResume = { paused -> 
+                isPaused = paused 
+                if (paused) {
+                    translationOverlayView?.setText("")
+                }
+            },
             onStop = { stopSelf() }
         )
         val controlParams = WindowManager.LayoutParams(
@@ -110,9 +131,8 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.BOTTOM or Gravity.END
-            x = 50
-            y = 50
+            gravity = Gravity.CENTER_VERTICAL or Gravity.END
+            this.x = 16
         }
         controlBarView?.params = controlParams
         windowManager.addView(controlBarView, controlParams)
@@ -122,17 +142,13 @@ class OverlayService : Service() {
         captureJob = scope.launch(Dispatchers.Default) {
             while (isActive) {
                 if (!isPaused) {
-                    val rectView = rectangleSelectorView
-                    if (rectView != null && rectView.params != null) {
+                    val area = selectedArea
+                    if (area != null) {
                         try {
-                            val location = IntArray(2)
-                            withContext(Dispatchers.Main) {
-                                rectView.getLocationOnScreen(location)
-                            }
-                            val x = location[0]
-                            val y = location[1]
-                            val w = rectView.width
-                            val h = rectView.height
+                            val x = area[0]
+                            val y = area[1]
+                            val w = area[2]
+                            val h = area[3]
 
                             if (w > 0 && h > 0) {
                                 val bitmap = screenCaptureManager.captureRect(x, y, w, h)
@@ -140,11 +156,15 @@ class OverlayService : Service() {
                                     val text = ocrManager.extractText(bitmap)
                                     if (text.isNotBlank()) {
                                         val translated = translateManager.translate(text)
-                                        if (translated != null) {
+                                        if (!translated.isNullOrBlank()) {
                                             withContext(Dispatchers.Main) {
                                                 translationOverlayView?.setText(translated)
                                             }
+                                        } else {
+                                            withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
                                         }
+                                    } else {
+                                        withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
                                     }
                                 }
                             }

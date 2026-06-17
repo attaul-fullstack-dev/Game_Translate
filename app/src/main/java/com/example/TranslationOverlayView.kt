@@ -53,34 +53,19 @@ class TranslationOverlayView(context: Context) : FrameLayout(context) {
                 val text by textState
                 val isVisible by visibleState
                 
-                if (isVisible) {
+                if (isVisible && text.isNotBlank()) {
                     Box(
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(8.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(Color(0xE61A1A2E)) // 90% opacity #1a1a2e
-                            .padding(12.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xE6000000)) // darker grayish-black
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
                     ) {
-                        Row(verticalAlignment = Alignment.Top) {
-                            Text(
-                                text = text,
-                                color = Color.White,
-                                fontSize = 14.sp,
-                                maxLines = 3,
-                                modifier = Modifier.weight(1f).padding(end = 8.dp)
-                            )
-                            IconButton(
-                                onClick = { visibleState.value = false },
-                                modifier = Modifier.size(24.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Close",
-                                    tint = Color.White
-                                )
-                            }
-                        }
+                        Text(
+                            text = text,
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            maxLines = 5
+                        )
                     }
                 }
             }
@@ -90,7 +75,7 @@ class TranslationOverlayView(context: Context) : FrameLayout(context) {
 
     fun setText(text: String) {
         textState.value = text
-        visibleState.value = text.isNotEmpty()
+        visibleState.value = text.isNotBlank()
     }
 }
 

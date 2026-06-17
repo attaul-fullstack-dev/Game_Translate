@@ -112,6 +112,7 @@ dependencies {
   implementation("com.google.mlkit:translate:17.0.3")
   implementation("com.google.mlkit:text-recognition:16.0.1")
   implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services")
+  implementation(libs.androidx.compose.material.icons.extended)
   androidTestImplementation(platform(libs.androidx.compose.bom))
   androidTestImplementation(libs.androidx.compose.ui.test.junit4)
   androidTestImplementation(libs.androidx.espresso.core)
