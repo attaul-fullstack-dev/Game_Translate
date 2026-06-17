@@ -16,6 +16,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -65,6 +66,9 @@ class MainActivity : ComponentActivity() {
         var hasOverlayPerm by remember { mutableStateOf(PermissionHelper.hasOverlayPermission(this)) }
         var isModelDownloaded by remember { mutableStateOf(false) }
         var isDownloading by remember { mutableStateOf(false) }
+        var selectedTab by remember { mutableIntStateOf(0) }
+        var testResult by remember { mutableStateOf("") }
+        var testError by remember { mutableStateOf("") }
 
         LaunchedEffect(Unit) {
             while (true) {
@@ -92,8 +96,8 @@ class MainActivity : ComponentActivity() {
                     contentColor = Color.White
                 ) {
                     NavigationBarItem(
-                        selected = true,
-                        onClick = { },
+                        selected = selectedTab == 0,
+                        onClick = { selectedTab = 0 },
                         icon = { Icon(Icons.Default.Home, contentDescription = "Beranda") },
                         label = { Text("Beranda") },
                         colors = NavigationBarItemDefaults.colors(
@@ -103,14 +107,25 @@ class MainActivity : ComponentActivity() {
                         )
                     )
                     NavigationBarItem(
-                        selected = false,
-                        onClick = { },
+                        selected = selectedTab == 1,
+                        onClick = { selectedTab = 1 },
+                        icon = { Icon(Icons.Default.Translate, contentDescription = "Translate") },
+                        label = { Text("Translate") },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = MaterialTheme.colorScheme.primary,
+                            selectedTextColor = MaterialTheme.colorScheme.primary,
+                            indicatorColor = Color.Transparent
+                        )
+                    )
+                    NavigationBarItem(
+                        selected = selectedTab == 2,
+                        onClick = { selectedTab = 2 },
                         icon = { Icon(Icons.Default.Settings, contentDescription = "Pengaturan") },
                         label = { Text("Pengaturan") }
                     )
                     NavigationBarItem(
-                        selected = false,
-                        onClick = { },
+                        selected = selectedTab == 3,
+                        onClick = { selectedTab = 3 },
                         icon = { Icon(Icons.Default.Folder, contentDescription = "Model") },
                         label = { Text("Model") }
                     )
@@ -146,8 +161,9 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.padding(bottom = 32.dp)
                     )
 
-                    // Cards Layout
-                    // Status Overlay
+                    if (selectedTab == 0) {
+                        // Cards Layout
+                        // Status Overlay
                     StatusCard(
                         title = "Status Overlay",
                         subtitle = if (hasOverlayPerm) "Aktif" else "Tidak Aktif",
@@ -279,6 +295,45 @@ class MainActivity : ComponentActivity() {
                         color = Color.Gray,
                         textAlign = TextAlign.Center
                     )
+                    } else if (selectedTab == 1) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(text = "Test Terjemahan (Inggris -> Indonesia)", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Button(
+                                    onClick = {
+                                        scope.launch {
+                                            try {
+                                                val res = translateManager.testTranslation("Hello")
+                                                testResult = res
+                                                testError = ""
+                                            } catch (e: Exception) {
+                                                testResult = ""
+                                                testError = e.localizedMessage ?: "Unknown Error"
+                                            }
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Text("Test Translation", color = Color.White)
+                                }
+                                
+                                if (testResult.isNotEmpty()) {
+                                    Spacer(modifier = Modifier.height(16.dp))
+                                    Text("Hasil: $testResult", color = Color.Green, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                }
+                                if (testError.isNotEmpty()) {
+                                    Spacer(modifier = Modifier.height(16.dp))
+                                    Text("Error: $testError", color = Color.Red, fontSize = 14.sp)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
