@@ -2,15 +2,11 @@ package com.example
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.PixelFormat
-import android.view.Gravity
 import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.FrameLayout
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -26,19 +22,13 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleOwner
-import androidx.lifecycle.LifecycleRegistry
 import androidx.lifecycle.setViewTreeLifecycleOwner
-import androidx.savedstate.SavedStateRegistry
-import androidx.savedstate.SavedStateRegistryController
-import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 
-@SuppressLint("ViewConstructor")
+@SuppressLint("ViewConstructor", "ClickableViewAccessibility")
 class RectangleSelectorView(
     context: Context,
     private val windowManager: WindowManager,
@@ -47,6 +37,7 @@ class RectangleSelectorView(
 ) : FrameLayout(context) {
 
     var params: WindowManager.LayoutParams? = null
+
     private var isResizing = false
     private var initialX = 0
     private var initialY = 0
@@ -68,29 +59,8 @@ class RectangleSelectorView(
         val composeView = ComposeView(context).apply {
             setContent {
                 Box(modifier = Modifier.fillMaxSize()) {
-                    // Action Buttons (inside the box)
-                    Row(
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(8.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFF1A1A2E)),
-                        horizontalArrangement = Arrangement.Center
-                    ) {
-                        IconButton(onClick = {
-                           val p = params ?: return@IconButton
-                           val location = IntArray(2)
-                           this@RectangleSelectorView.getLocationOnScreen(location)
-                           onConfirm(location[0], location[1], p.width, p.height)
-                        }) {
-                            Icon(Icons.Default.Check, "Confirm", tint = Color.Green)
-                        }
-                        IconButton(onClick = onCancel) {
-                            Icon(Icons.Default.Close, "Cancel", tint = Color.Red)
-                        }
-                    }
 
-                    // The Dashed Box
+                    // Dashed border box
                     Canvas(modifier = Modifier.fillMaxSize()) {
                         val stroke = Stroke(
                             width = 6f,
@@ -107,7 +77,29 @@ class RectangleSelectorView(
                         )
                     }
 
-                    // Resize handle
+                    // Action buttons top-end
+                    Row(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(8.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFF1A1A2E)),
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        IconButton(onClick = {
+                            val p = params ?: return@IconButton
+                            val location = IntArray(2)
+                            this@RectangleSelectorView.getLocationOnScreen(location)
+                            onConfirm(location[0], location[1], p.width, p.height)
+                        }) {
+                            Icon(Icons.Default.Check, "Confirm", tint = Color.Green)
+                        }
+                        IconButton(onClick = onCancel) {
+                            Icon(Icons.Default.Close, "Cancel", tint = Color.Red)
+                        }
+                    }
+
+                    // Resize handle bottom-end
                     Box(
                         modifier = Modifier
                             .align(Alignment.BottomEnd)
@@ -123,7 +115,6 @@ class RectangleSelectorView(
 
         addView(composeView)
 
-        // Same touch handling logic
         setOnTouchListener { _, event ->
             val layoutParams = params ?: return@setOnTouchListener true
             when (event.action) {
@@ -136,8 +127,9 @@ class RectangleSelectorView(
                     initialHeight = layoutParams.height
 
                     val cornerSizePixels = 88f
-                    isResizing = event.x >= layoutParams.width - cornerSizePixels && event.y >= layoutParams.height - cornerSizePixels
-                    return@setOnTouchListener false // let compose handle clicks on buttons
+                    isResizing = event.x >= layoutParams.width - cornerSizePixels &&
+                            event.y >= layoutParams.height - cornerSizePixels
+                    return@setOnTouchListener false
                 }
                 MotionEvent.ACTION_MOVE -> {
                     if (isResizing) {
