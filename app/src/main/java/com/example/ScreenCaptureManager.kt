@@ -56,6 +56,12 @@ class ScreenCaptureManager(private val context: Context) {
     }
 
     fun captureRect(x: Int, y: Int, w: Int, h: Int): Bitmap? {
+    // Swap koordinat jika landscape
+    val isLandscape = captureWidth > captureHeight
+    val adjX = if (isLandscape) y else x
+    val adjY = if (isLandscape) x else y
+    val adjW = if (isLandscape) h else w
+    val adjH = if (isLandscape) w else h
         val reader = imageReader ?: return null
         var image: Image? = null
         try {
@@ -75,10 +81,10 @@ class ScreenCaptureManager(private val context: Context) {
             fullBitmap.copyPixelsFromBuffer(buffer)
 
             // Koordinat sudah absolut dari getLocationOnScreen, langsung pakai
-            val safeX = maxOf(0, x)
-            val safeY = maxOf(0, y)
-            val safeW = minOf(w, captureWidth - safeX)
-            val safeH = minOf(h, captureHeight - safeY)
+            val safeX = maxOf(0, adjX)
+            val safeY = maxOf(0, adjY)
+            val safeW = minOf(adjW, captureWidth - safeX)
+            val safeH = minOf(adjH, captureHeight - safeY)
 
             if (safeW <= 0 || safeH <= 0) {
                 Log.e("ScreenCapture", "Invalid rect: x=$safeX y=$safeY w=$safeW h=$safeH")
