@@ -308,8 +308,9 @@ class MainActivity : ComponentActivity() {
                                     onClick = {
                                         scope.launch {
                                             try {
-                                                val res = translateManager.testTranslation("Hello")
-                                                testResult = res
+                                                translateManager.resetLastText()
+                                                val res = translateManager.translate("Hello")
+                                                testResult = res ?: "Tidak ada hasil (atau teks sama)"
                                                 testError = ""
                                             } catch (e: Exception) {
                                                 testResult = ""
