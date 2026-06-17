@@ -78,10 +78,10 @@ class RectangleSelectorView(
                         horizontalArrangement = Arrangement.Center
                     ) {
                         IconButton(onClick = {
-                            val p = params
-                            if (p != null) {
-                                onConfirm(p.x, p.y, p.width, p.height)
-                            }
+                           val p = params ?: return@IconButton
+                           val location = IntArray(2)
+                           this@RectangleSelectorView.getLocationOnScreen(location)
+                           onConfirm(location[0], location[1], p.width, p.height)
                         }) {
                             Icon(Icons.Default.Check, "Confirm", tint = Color.Green)
                         }
