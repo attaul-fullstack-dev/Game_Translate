@@ -20,13 +20,21 @@ class ScreenCaptureManager(private val context: Context) {
     
     private var screenWidth = 0
     private var screenHeight = 0
-
+    private var scaleX = 1f
+    private var scaleY = 1f
+    
     fun start(resultCode: Int, data: Intent, width: Int, height: Int, density: Int) {
         val projectionManager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = projectionManager.getMediaProjection(resultCode, data)
         
         screenWidth = width
         screenHeight = height
+
+        val realMetrics = android.util.DisplayMetrics()
+        (context.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager)
+            .defaultDisplay.getRealMetrics(realMetrics)
+        scaleX = width.toFloat() / realMetrics.widthPixels
+        scaleY = height.toFloat() / realMetrics.heightPixels
         
         @SuppressLint("WrongConstant")
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
@@ -59,10 +67,10 @@ class ScreenCaptureManager(private val context: Context) {
             bitmap.copyPixelsFromBuffer(buffer)
             
             // Adjust bounds to avoid crashing if rectangle goes out of screen
-            val safeX = maxOf(0, x)
-            val safeY = maxOf(0, y)
-            val safeW = minOf(w, screenWidth - safeX)
-            val safeH = minOf(h, screenHeight - safeY)
+            val safeX = maxOf(0, (x * scaleX).toInt())
+            val safeY = maxOf(0, (y * scaleY).toInt())
+            val safeW = minOf((w * scaleX).toInt(), screenWidth - safeX)
+            val safeH = minOf((h * scaleY).toInt(), screenHeight - safeY)
 
             if (safeW <= 0 || safeH <= 0) return null
 
