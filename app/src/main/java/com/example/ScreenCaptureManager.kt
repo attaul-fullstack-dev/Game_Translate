@@ -76,7 +76,9 @@ class ScreenCaptureManager(private val context: Context) {
 
         Log.d("ScreenCapture", "Started: ${captureWidth}x${captureHeight}")
     }
-
+        fun resetBitmap() {
+    latestBitmap = null
+        }
     fun captureRect(x: Int, y: Int, w: Int, h: Int): Bitmap? {
         val full = latestBitmap ?: return null
 
