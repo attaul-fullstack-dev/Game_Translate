@@ -255,6 +255,23 @@ class OverlayService : Service() {
         translateManager.close()
     }
 
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Screen may have rotated: rebuild the VirtualDisplay/ImageReader so captured
+        // frames match the new orientation (Masalah 2). The previously selected area
+        // no longer maps to the rotated screen, so clear it and drop back to PAUSED
+        // until the user re-selects, rather than capturing the wrong region.
+        screenCaptureManager.createVirtualDisplay()
+        screenCaptureManager.resetBitmap()
+        if (selectedArea != null) {
+            selectedArea = null
+            translationOverlayView?.let { windowManager.removeView(it) }
+            translationOverlayView = null
+            currentState = OverlayState.IDLE
+            controlBarView?.updateState(currentState)
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createNotificationChannel() {
