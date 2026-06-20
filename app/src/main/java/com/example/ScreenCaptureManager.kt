@@ -95,11 +95,14 @@ class ScreenCaptureManager(private val context: Context) {
                 val buffer = planes[0].buffer
                 val pixelStride = planes[0].pixelStride
                 val rowStride = planes[0].rowStride
-                val rowPadding = rowStride - pixelStride * captureWidth
 
-                // Source bitmap is padded to rowStride/pixelStride columns.
+                // Width must be derived from rowStride/pixelStride, not
+                // captureWidth + rowPadding/pixelStride: the latter truncates when
+                // rowPadding isn't an exact multiple of pixelStride, producing a
+                // bitmap one pixel too narrow → "Buffer not large enough for pixels".
+                val bmpWidth = rowStride / pixelStride
                 val padded = Bitmap.createBitmap(
-                    captureWidth + rowPadding / pixelStride,
+                    bmpWidth,
                     captureHeight,
                     Bitmap.Config.ARGB_8888
                 )
