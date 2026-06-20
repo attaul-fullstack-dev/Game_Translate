@@ -9,7 +9,9 @@ import android.content.Intent
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
+import android.util.DisplayMetrics
 import android.view.Gravity
+import android.view.Surface
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
@@ -23,13 +25,18 @@ class OverlayService : Service() {
 
     private var rectangleSelectorView: RectangleSelectorView? = null
     private var translationOverlayView: TranslationOverlayView? = null
+    private var translationOverlayParams: WindowManager.LayoutParams? = null
     private var controlBarView: ControlBarView? = null
 
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private var captureJob: Job? = null
 
     private var currentState = OverlayState.IDLE
+    // selectedArea is stored in the coordinate frame of the orientation it was
+    // selected in (selectionRotation). It is converted to the CURRENT rotation
+    // before every capture / overlay placement so it stays aligned after rotation.
     private var selectedArea: IntArray? = null
+    private var selectionRotation: Int = Surface.ROTATION_0
 
     override fun onCreate() {
         super.onCreate()
@@ -117,6 +124,7 @@ class OverlayService : Service() {
             windowManager = windowManager,
             onConfirm = { x, y, w, h ->
                 selectedArea = intArrayOf(x, y, w, h)
+                selectionRotation = currentRotation()
 
                 DebugStore.selectedAreaX.value = x
                 DebugStore.selectedAreaY.value = y
@@ -126,7 +134,8 @@ class OverlayService : Service() {
                 rectangleSelectorView?.let { windowManager.removeView(it) }
                 rectangleSelectorView = null
 
-                setupTranslationOverlay(x, y, w, h)
+                val r = currentArea()
+                setupTranslationOverlay(r[0], r[1], r[2], r[3])
 
                 currentState = OverlayState.ACTIVE
                 controlBarView?.updateState(currentState)
@@ -172,6 +181,7 @@ class OverlayService : Service() {
             this.x = x
             this.y = y
         }
+        translationOverlayParams = transParams
         windowManager.addView(translationOverlayView, transParams)
     }
 
@@ -184,13 +194,26 @@ class OverlayService : Service() {
 
             while (isActive) {
                 if (currentState == OverlayState.ACTIVE) {
-                    val area = selectedArea
+                    val area = if (selectedArea != null) currentArea() else null
                     if (area != null && area[2] > 0 && area[3] > 0) {
                         try {
                             val x = area[0]
                             val y = area[1]
                             val w = area[2]
                             val h = area[3]
+
+                            // Keep the overlay window aligned with the (possibly
+                            // converted) capture rect for the current orientation.
+                            withContext(Dispatchers.Main) {
+                                translationOverlayParams?.let { p ->
+                                    if (p.x != x || p.y != y || p.width != w) {
+                                        p.x = x; p.y = y; p.width = w
+                                        translationOverlayView?.let { v ->
+                                            windowManager.updateViewLayout(v, p)
+                                        }
+                                    }
+                                }
+                            }
 
                             DebugStore.captureStatus.value = "CAPTURING..."
                             val bitmap = screenCaptureManager.captureRect(x, y, w, h)
@@ -258,18 +281,62 @@ class OverlayService : Service() {
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
         // Screen may have rotated: rebuild the VirtualDisplay/ImageReader so captured
-        // frames match the new orientation (Masalah 2). The previously selected area
-        // no longer maps to the rotated screen, so clear it and drop back to PAUSED
-        // until the user re-selects, rather than capturing the wrong region.
+        // frames match the new orientation. The selection is kept — currentArea()
+        // converts it from selectionRotation into the new rotation, and the capture
+        // loop repositions the overlay accordingly on its next tick.
         screenCaptureManager.createVirtualDisplay()
         screenCaptureManager.resetBitmap()
-        if (selectedArea != null) {
-            selectedArea = null
-            translationOverlayView?.let { windowManager.removeView(it) }
-            translationOverlayView = null
-            currentState = OverlayState.IDLE
-            controlBarView?.updateState(currentState)
+    }
+
+    /** Current display rotation (Surface.ROTATION_*). */
+    private fun currentRotation(): Int {
+        @Suppress("DEPRECATION")
+        return windowManager.defaultDisplay.rotation
+    }
+
+    /** Real screen size for a given rotation, expressed as (width, height). */
+    private fun screenSizeFor(rotation: Int): Pair<Int, Int> {
+        val m = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(m)
+        // getRealMetrics reports the CURRENT rotation's dimensions. Reduce to the
+        // device's natural portrait size (shorter side = width), then express the
+        // requested rotation: landscape (90/270) swaps width and height.
+        val natW = minOf(m.widthPixels, m.heightPixels)
+        val natH = maxOf(m.widthPixels, m.heightPixels)
+        val reqLandscape = rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270
+        return if (reqLandscape) Pair(natH, natW) else Pair(natW, natH)
+    }
+
+    /**
+     * Convert selectedArea from selectionRotation into the current rotation.
+     * Returns [x, y, w, h] in the current orientation's pixel space, used for BOTH
+     * captureRect and the overlay window so they always agree.
+     */
+    private fun currentArea(): IntArray {
+        val a = selectedArea ?: return intArrayOf(0, 0, 0, 0)
+        val from = selectionRotation
+        val to = currentRotation()
+        if (from == to) return a
+
+        // Source-orientation screen size.
+        val (sw, sh) = screenSizeFor(from)
+
+        // Number of 90° clockwise steps from source to target.
+        val steps = ((to - from) % 4 + 4) % 4
+        var rx = a[0]; var ry = a[1]; var rw = a[2]; var rh = a[3]
+        var curW = sw; var curH = sh
+        repeat(steps) {
+            // Rotate rect 90° clockwise within a curW x curH frame.
+            val nx = curH - (ry + rh)
+            val ny = rx
+            val nw = rh
+            val nh = rw
+            rx = nx; ry = ny; rw = nw; rh = nh
+            // Frame dimensions swap after each 90° step.
+            val t = curW; curW = curH; curH = t
         }
+        return intArrayOf(rx, ry, rw, rh)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
