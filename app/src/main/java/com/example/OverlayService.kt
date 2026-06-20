@@ -11,12 +11,18 @@ import android.os.Build
 import android.os.IBinder
 import android.util.DisplayMetrics
 import android.view.Gravity
-import android.view.Surface
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 
 class OverlayService : Service() {
+
+    companion object {
+        // Direction of the portrait→landscape mapping. Default CCW matches the
+        // on-device measurement. Flip to true if capture/overlay land 180°-off
+        // or mirrored on the target device.
+        private const val CLOCKWISE = false
+    }
 
     private lateinit var windowManager: WindowManager
     private lateinit var screenCaptureManager: ScreenCaptureManager
@@ -32,11 +38,11 @@ class OverlayService : Service() {
     private var captureJob: Job? = null
 
     private var currentState = OverlayState.IDLE
-    // selectedArea is stored in the coordinate frame of the orientation it was
-    // selected in (selectionRotation). It is converted to the CURRENT rotation
-    // before every capture / overlay placement so it stays aligned after rotation.
+    // selectedArea is stored in PORTRAIT window space (the selector/overlay live in
+    // the system's portrait orientation). The game is force-landscape, so the
+    // MediaProjection bitmap is in LANDSCAPE space. captureRect needs the rect
+    // mapped portrait→landscape; the overlay keeps the original portrait coords.
     private var selectedArea: IntArray? = null
-    private var selectionRotation: Int = Surface.ROTATION_0
 
     override fun onCreate() {
         super.onCreate()
@@ -124,7 +130,6 @@ class OverlayService : Service() {
             windowManager = windowManager,
             onConfirm = { x, y, w, h ->
                 selectedArea = intArrayOf(x, y, w, h)
-                selectionRotation = currentRotation()
 
                 DebugStore.selectedAreaX.value = x
                 DebugStore.selectedAreaY.value = y
@@ -134,8 +139,8 @@ class OverlayService : Service() {
                 rectangleSelectorView?.let { windowManager.removeView(it) }
                 rectangleSelectorView = null
 
-                val r = currentArea()
-                setupTranslationOverlay(r[0], r[1], r[2], r[3])
+                // Overlay uses ORIGINAL portrait coords (same space as the selector).
+                setupTranslationOverlay(x, y, w, h)
 
                 currentState = OverlayState.ACTIVE
                 controlBarView?.updateState(currentState)
@@ -167,8 +172,12 @@ class OverlayService : Service() {
         translationOverlayView?.let { windowManager.removeView(it) }
         translationOverlayView = TranslationOverlayView(this)
 
+        // Overlay windows are composited in the game's landscape frame, so convert
+        // the portrait selection the same way the capture crop is converted.
+        val o = toOverlayRect(intArrayOf(x, y, w, h))
+
         val transParams = WindowManager.LayoutParams(
-            w,
+            o[2],
             WindowManager.LayoutParams.WRAP_CONTENT,
             getLayoutFlag(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -178,8 +187,8 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
        ).apply {
             gravity = Gravity.TOP or Gravity.START
-            this.x = x
-            this.y = y
+            this.x = o[0]
+            this.y = o[1]
         }
         translationOverlayParams = transParams
         windowManager.addView(translationOverlayView, transParams)
@@ -194,26 +203,14 @@ class OverlayService : Service() {
 
             while (isActive) {
                 if (currentState == OverlayState.ACTIVE) {
-                    val area = if (selectedArea != null) currentArea() else null
+                    // Map the portrait selection into the landscape bitmap space.
+                    val area = selectedArea?.let { toBitmapRect(it) }
                     if (area != null && area[2] > 0 && area[3] > 0) {
                         try {
                             val x = area[0]
                             val y = area[1]
                             val w = area[2]
                             val h = area[3]
-
-                            // Keep the overlay window aligned with the (possibly
-                            // converted) capture rect for the current orientation.
-                            withContext(Dispatchers.Main) {
-                                translationOverlayParams?.let { p ->
-                                    if (p.x != x || p.y != y || p.width != w) {
-                                        p.x = x; p.y = y; p.width = w
-                                        translationOverlayView?.let { v ->
-                                            windowManager.updateViewLayout(v, p)
-                                        }
-                                    }
-                                }
-                            }
 
                             DebugStore.captureStatus.value = "CAPTURING..."
                             val bitmap = screenCaptureManager.captureRect(x, y, w, h)
@@ -278,65 +275,63 @@ class OverlayService : Service() {
         translateManager.close()
     }
 
-    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
-        super.onConfigurationChanged(newConfig)
-        // Screen may have rotated: rebuild the VirtualDisplay/ImageReader so captured
-        // frames match the new orientation. The selection is kept — currentArea()
-        // converts it from selectionRotation into the new rotation, and the capture
-        // loop repositions the overlay accordingly on its next tick.
-        screenCaptureManager.createVirtualDisplay()
-        screenCaptureManager.resetBitmap()
-    }
-
-    /** Current display rotation (Surface.ROTATION_*). */
-    private fun currentRotation(): Int {
-        @Suppress("DEPRECATION")
-        return windowManager.defaultDisplay.rotation
-    }
-
-    /** Real screen size for a given rotation, expressed as (width, height). */
-    private fun screenSizeFor(rotation: Int): Pair<Int, Int> {
+    /** Device portrait dimensions as (width, height); system stays portrait. */
+    private fun portraitSize(): Pair<Float, Float> {
         val m = DisplayMetrics()
         @Suppress("DEPRECATION")
         windowManager.defaultDisplay.getRealMetrics(m)
-        // getRealMetrics reports the CURRENT rotation's dimensions. Reduce to the
-        // device's natural portrait size (shorter side = width), then express the
-        // requested rotation: landscape (90/270) swaps width and height.
-        val natW = minOf(m.widthPixels, m.heightPixels)
-        val natH = maxOf(m.widthPixels, m.heightPixels)
-        val reqLandscape = rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270
-        return if (reqLandscape) Pair(natH, natW) else Pair(natW, natH)
+        return Pair(
+            minOf(m.widthPixels, m.heightPixels).toFloat(),  // portrait width
+            maxOf(m.widthPixels, m.heightPixels).toFloat()   // portrait height
+        )
     }
 
     /**
-     * Convert selectedArea from selectionRotation into the current rotation.
-     * Returns [x, y, w, h] in the current orientation's pixel space, used for BOTH
-     * captureRect and the overlay window so they always agree.
+     * Rotate a rect from PORTRAIT window space into the force-landscape frame
+     * (size ph x pw). Used by BOTH the overlay placement and the capture crop so
+     * the two can never diverge. Result is [x, y, w, h] as floats.
+     *
+     * Default is 90° CCW, matching the on-device measurement
+     * (lx = y, ly = portraitWidth - x - w). If captures/overlay land 180°-off or
+     * mirrored, flip CLOCKWISE to true.
      */
-    private fun currentArea(): IntArray {
-        val a = selectedArea ?: return intArrayOf(0, 0, 0, 0)
-        val from = selectionRotation
-        val to = currentRotation()
-        if (from == to) return a
-
-        // Source-orientation screen size.
-        val (sw, sh) = screenSizeFor(from)
-
-        // Number of 90° clockwise steps from source to target.
-        val steps = ((to - from) % 4 + 4) % 4
-        var rx = a[0]; var ry = a[1]; var rw = a[2]; var rh = a[3]
-        var curW = sw; var curH = sh
-        repeat(steps) {
-            // Rotate rect 90° clockwise within a curW x curH frame.
-            val nx = curH - (ry + rh)
-            val ny = rx
-            val nw = rh
-            val nh = rw
-            rx = nx; ry = ny; rw = nw; rh = nh
-            // Frame dimensions swap after each 90° step.
-            val t = curW; curW = curH; curH = t
+    private fun rotatePortraitToLandscape(a: IntArray): FloatArray {
+        val (pw, ph) = portraitSize()
+        val x = a[0]; val y = a[1]; val w = a[2]; val h = a[3]
+        val rx: Float; val ry: Float
+        if (CLOCKWISE) {
+            rx = ph - (y + h)
+            ry = x.toFloat()
+        } else {
+            rx = y.toFloat()
+            ry = pw - (x + w)
         }
-        return intArrayOf(rx, ry, rw, rh)
+        return floatArrayOf(rx, ry, h.toFloat(), w.toFloat())
+    }
+
+    /** Overlay window position in the landscape frame (no scaling — window space). */
+    private fun toOverlayRect(a: IntArray): IntArray {
+        val r = rotatePortraitToLandscape(a)
+        return intArrayOf(r[0].toInt(), r[1].toInt(), r[2].toInt(), r[3].toInt())
+    }
+
+    /**
+     * Capture crop in ACTUAL bitmap pixels: same rotation as the overlay, then
+     * scaled from the portrait-derived landscape frame (ph x pw) to the real
+     * bitmap size in case they differ (nav bar, rounding, etc.).
+     */
+    private fun toBitmapRect(a: IntArray): IntArray {
+        val (bmpW, bmpH) = screenCaptureManager.bitmapSize() ?: return a
+        val (pw, ph) = portraitSize()
+        val r = rotatePortraitToLandscape(a)
+        val sx = bmpW / ph
+        val sy = bmpH / pw
+        return intArrayOf(
+            (r[0] * sx).toInt(),
+            (r[1] * sy).toInt(),
+            (r[2] * sx).toInt(),
+            (r[3] * sy).toInt()
+        )
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

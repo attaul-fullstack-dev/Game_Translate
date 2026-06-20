@@ -34,6 +34,11 @@ class ScreenCaptureManager(private val context: Context) {
     @Volatile
     private var stopped = false
 
+    // Serializes the image-available callback (ScreenCaptureThread) against teardown
+    // (close/release on another thread). Without this, closing the ImageReader frees
+    // the native image buffer while copyPixelsFromBuffer is still reading it → SIGSEGV.
+    private val captureLock = Any()
+
     // Mandatory on targetSdk 34+: createVirtualDisplay() throws IllegalStateException
     // if no callback is registered before it is called.
     private val projectionCallback = object : MediaProjection.Callback() {
@@ -82,45 +87,66 @@ class ScreenCaptureManager(private val context: Context) {
         captureHeight = metrics.heightPixels
         densityDpi = metrics.densityDpi
 
-        // Release previous resources before recreating.
-        virtualDisplay?.release()
-        imageReader?.close()
-        latestBitmap = null
+        // Release previous resources before recreating. Take the lock so we don't
+        // close the old reader while its callback is mid-copy (SIGSEGV otherwise).
+        synchronized(captureLock) {
+            virtualDisplay?.release()
+            imageReader?.close()
+            virtualDisplay = null
+            imageReader = null
+            latestBitmap = null
+        }
 
         val reader = ImageReader.newInstance(captureWidth, captureHeight, PixelFormat.RGBA_8888, 2)
         reader.setOnImageAvailableListener({ r ->
-            val image = r.acquireLatestImage() ?: return@setOnImageAvailableListener
-            try {
-                val planes = image.planes
-                val buffer = planes[0].buffer
-                val pixelStride = planes[0].pixelStride
-                val rowStride = planes[0].rowStride
-
-                // Width must be derived from rowStride/pixelStride, not
-                // captureWidth + rowPadding/pixelStride: the latter truncates when
-                // rowPadding isn't an exact multiple of pixelStride, producing a
-                // bitmap one pixel too narrow → "Buffer not large enough for pixels".
-                val bmpWidth = rowStride / pixelStride
-                val padded = Bitmap.createBitmap(
-                    bmpWidth,
-                    captureHeight,
-                    Bitmap.Config.ARGB_8888
-                )
-                padded.copyPixelsFromBuffer(buffer)
-
-                // Trim the padding so latestBitmap is EXACTLY captureWidth x captureHeight.
-                // Crop coordinates assume an unpadded screen-sized bitmap.
-                latestBitmap = if (padded.width != captureWidth) {
-                    val trimmed = Bitmap.createBitmap(padded, 0, 0, captureWidth, captureHeight)
-                    padded.recycle()
-                    trimmed
-                } else {
-                    padded
+            // Hold the lock for the WHOLE callback so teardown (which also takes the
+            // lock) cannot free the native buffer mid-copy. Bail early if stopped.
+            synchronized(captureLock) {
+                if (stopped) {
+                    // Drain so the reader doesn't stall, but don't touch the buffer.
+                    try { r.acquireLatestImage()?.close() } catch (_: Throwable) {}
+                    return@synchronized
                 }
-            } catch (e: Exception) {
-                DebugStore.logError(e)
-            } finally {
-                image.close()
+                var image: android.media.Image? = null
+                try {
+                    image = r.acquireLatestImage() ?: return@synchronized
+                    val planes = image.planes
+                    val buffer = planes[0].buffer.also { it.rewind() }
+                    val pixelStride = planes[0].pixelStride
+                    val rowStride = planes[0].rowStride
+
+                    // Width derived from rowStride/pixelStride (handles row padding).
+                    val bmpWidth = rowStride / pixelStride
+
+                    // Guard against a buffer/bitmap size mismatch BEFORE the native
+                    // copy — a too-small buffer is the other path to a SIGSEGV.
+                    val needed = bmpWidth * captureHeight * pixelStride
+                    if (buffer.remaining() < needed) {
+                        Log.w("ScreenCapture", "Buffer too small: have=${buffer.remaining()} need=$needed")
+                        return@synchronized
+                    }
+
+                    val padded = Bitmap.createBitmap(
+                        bmpWidth,
+                        captureHeight,
+                        Bitmap.Config.ARGB_8888
+                    )
+                    padded.copyPixelsFromBuffer(buffer)
+
+                    // Trim padding so latestBitmap is EXACTLY captureWidth x captureHeight.
+                    latestBitmap = if (padded.width != captureWidth) {
+                        val trimmed = Bitmap.createBitmap(padded, 0, 0, captureWidth, captureHeight)
+                        padded.recycle()
+                        trimmed
+                    } else {
+                        padded
+                    }
+                } catch (e: Throwable) {
+                    // Never let the capture thread crash the process.
+                    DebugStore.logError(if (e is Exception) e else RuntimeException(e))
+                } finally {
+                    image?.close()
+                }
             }
         }, handler)
         imageReader = reader
@@ -137,6 +163,12 @@ class ScreenCaptureManager(private val context: Context) {
 
     fun resetBitmap() {
         latestBitmap = null
+    }
+
+    /** Actual size of the most recent captured frame (landscape for a force-landscape game), or null. */
+    fun bitmapSize(): Pair<Int, Int>? {
+        val b = latestBitmap ?: return null
+        return Pair(b.width, b.height)
     }
 
     fun captureRect(x: Int, y: Int, w: Int, h: Int): Bitmap? {
@@ -161,16 +193,20 @@ class ScreenCaptureManager(private val context: Context) {
     }
 
     fun stop() {
+        // Set stopped first so an in-flight callback bails, then take the lock to
+        // ensure no copy is in progress before we free native buffers.
         stopped = true
-        virtualDisplay?.release()
-        imageReader?.close()
-        mediaProjection?.unregisterCallback(projectionCallback)
-        mediaProjection?.stop()
-        handlerThread.quitSafely()
+        synchronized(captureLock) {
+            virtualDisplay?.release()
+            imageReader?.close()
+            mediaProjection?.unregisterCallback(projectionCallback)
+            mediaProjection?.stop()
 
-        virtualDisplay = null
-        imageReader = null
-        mediaProjection = null
-        latestBitmap = null
+            virtualDisplay = null
+            imageReader = null
+            mediaProjection = null
+            latestBitmap = null
+        }
+        handlerThread.quitSafely()
     }
 }
