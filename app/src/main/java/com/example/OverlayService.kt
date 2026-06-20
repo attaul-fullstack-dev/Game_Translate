@@ -23,6 +23,7 @@ class OverlayService : Service() {
 
     private var rectangleSelectorView: RectangleSelectorView? = null
     private var translationOverlayView: TranslationOverlayView? = null
+    private var translationOverlayParams: WindowManager.LayoutParams? = null
     private var controlBarView: ControlBarView? = null
 
     private val scope = CoroutineScope(Dispatchers.Main + Job())
@@ -172,6 +173,7 @@ class OverlayService : Service() {
             this.x = x
             this.y = y
         }
+        translationOverlayParams = transParams
         windowManager.addView(translationOverlayView, transParams)
     }
 
