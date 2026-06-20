@@ -555,6 +555,9 @@ class MainActivity : ComponentActivity() {
         } else {
             startService(serviceIntent)
         }
-        finish() // Close main app to show game
+        // Move to background instead of finish() so the activity (and its
+        // MediaProjection result) is not torn down — finishing here can cause the
+        // projection to capture our own (now closing) task instead of the game.
+        moveTaskToBack(true)
     }
 }
