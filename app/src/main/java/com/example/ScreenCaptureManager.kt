@@ -38,6 +38,9 @@ class ScreenCaptureManager(
     @Volatile
     private var stopped = false
 
+    @Volatile
+    private var frameSequence = 0L
+
     // Serializes the image-available callback (ScreenCaptureThread) against teardown
     // (close/release on another thread). Without this, closing the ImageReader frees
     // the native image buffer while copyPixelsFromBuffer is still reading it → SIGSEGV.
@@ -202,6 +205,7 @@ class ScreenCaptureManager(
                         latestBitmap = frame
                     }
                     frame.copyPixelsFromBuffer(buffer)
+                    frameSequence++
                 } catch (e: Throwable) {
                     // Never let the capture thread crash the process.
                     DebugStore.logError(if (e is Exception) e else RuntimeException(e))
@@ -227,6 +231,8 @@ class ScreenCaptureManager(
             return Pair(captureWidth, captureHeight)
         }
     }
+
+    fun frameSequence(): Long = frameSequence
 
     fun captureRect(x: Int, y: Int, w: Int, h: Int): Bitmap? {
         synchronized(captureLock) {

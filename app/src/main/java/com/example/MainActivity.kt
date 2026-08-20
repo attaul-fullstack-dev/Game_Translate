@@ -321,7 +321,7 @@ class MainActivity : ComponentActivity() {
                     Spacer(modifier = Modifier.height(16.dp))
                     
                     Text(
-                        text = "Ketuk bubble untuk jeda/lanjut, tahan untuk memilih ulang area.",
+                        text = "Ketuk bubble aktif untuk jeda, lalu ketuk lagi untuk memilih ulang area.",
                         fontSize = 12.sp,
                         color = Color.Gray,
                         textAlign = TextAlign.Center
@@ -439,6 +439,11 @@ class MainActivity : ComponentActivity() {
         val selY by DebugStore.selectedAreaY
         val selW by DebugStore.selectedAreaW
         val selH by DebugStore.selectedAreaH
+        val selectedDisplayWidth by DebugStore.selectedDisplayWidth
+        val selectedDisplayHeight by DebugStore.selectedDisplayHeight
+        val selectedDisplayRotation by DebugStore.selectedDisplayRotation
+        val captureFrameWidth by DebugStore.captureFrameWidth
+        val captureFrameHeight by DebugStore.captureFrameHeight
         val enableTrans = DebugStore.enableTranslation.value
 
         Column(
@@ -467,6 +472,11 @@ class MainActivity : ComponentActivity() {
             
             Spacer(modifier = Modifier.height(8.dp))
             DiagnosticCard("Selected Area", "X:$selX Y:$selY W:$selW H:$selH")
+            DiagnosticCard(
+                "Selection Space",
+                "${selectedDisplayWidth}x$selectedDisplayHeight @ ${selectedDisplayRotation}°",
+            )
+            DiagnosticCard("Capture Frame", "${captureFrameWidth}x$captureFrameHeight")
 
             if (lastError.isNotBlank()) {
                 Spacer(modifier = Modifier.height(8.dp))
@@ -592,7 +602,18 @@ class MainActivity : ComponentActivity() {
         overlayPermissionState.value = PermissionHelper.hasOverlayPermission(this)
     }
 
+    override fun onStart() {
+        super.onStart()
+        DebugStore.isActivityVisible = true
+    }
+
+    override fun onStop() {
+        DebugStore.isActivityVisible = false
+        super.onStop()
+    }
+
     override fun onDestroy() {
+        DebugStore.isActivityVisible = false
         translateManager.close()
         super.onDestroy()
     }

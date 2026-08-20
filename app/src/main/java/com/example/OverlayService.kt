@@ -13,6 +13,7 @@ import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
 import android.view.Gravity
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
@@ -25,11 +26,18 @@ class OverlayService : Service() {
         const val ACTION_STOP = "com.aistudio.gametranslator.action.STOP"
         const val EXTRA_RESULT_CODE = "RESULT_CODE"
         const val EXTRA_DATA = "DATA"
+    }
 
-        // Direction of the portrait→landscape mapping. Default CCW matches the
-        // on-device measurement. Flip to true if capture/overlay land 180°-off
-        // or mirrored on the target device.
-        private const val CLOCKWISE = false
+    private data class SelectedArea(
+        val x: Int,
+        val y: Int,
+        val width: Int,
+        val height: Int,
+        val displayWidth: Int,
+        val displayHeight: Int,
+        val displayRotation: Int,
+    ) {
+        fun asRect(): IntArray = intArrayOf(x, y, width, height)
     }
 
     private lateinit var windowManager: WindowManager
@@ -39,7 +47,6 @@ class OverlayService : Service() {
 
     private var rectangleSelectorView: RectangleSelectorView? = null
     private var translationOverlayView: TranslationOverlayView? = null
-    private var translationOverlayParams: WindowManager.LayoutParams? = null
     private var controlBarView: ControlBarView? = null
 
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
@@ -47,12 +54,8 @@ class OverlayService : Service() {
 
     @Volatile
     private var currentState = OverlayState.IDLE
-    // selectedArea is stored in PORTRAIT window space (the selector/overlay live in
-    // the system's portrait orientation). The game is force-landscape, so the
-    // MediaProjection bitmap is in LANDSCAPE space. captureRect needs the rect
-    // mapped portrait→landscape; the overlay keeps the original portrait coords.
     @Volatile
-    private var selectedArea: IntArray? = null
+    private var selectedArea: SelectedArea? = null
     private var consecutiveBlankFrames = 0
 
     override fun onCreate() {
@@ -151,21 +154,32 @@ class OverlayService : Service() {
                 updateState(OverlayState.PAUSED)
                 translationOverlayView?.setText("")
             }
-            OverlayState.PAUSED -> {
-                updateState(OverlayState.ACTIVE)
-            }
+            OverlayState.PAUSED -> startSelectionMode()
             OverlayState.SELECTING -> cancelSelectionMode()
         }
     }
 
     private fun startSelectionMode() {
+        translationOverlayView?.setText("")
+        translationOverlayView?.setCaptureHidden(false)
         updateState(OverlayState.SELECTING)
 
         rectangleSelectorView = RectangleSelectorView(
             context = this,
             windowManager = windowManager,
             onConfirm = { x, y, w, h ->
-                selectedArea = intArrayOf(x, y, w, h)
+                val bounds = displayBounds()
+                val rotation = displayRotation()
+                val area = SelectedArea(
+                    x = x,
+                    y = y,
+                    width = w,
+                    height = h,
+                    displayWidth = bounds.width(),
+                    displayHeight = bounds.height(),
+                    displayRotation = rotation,
+                )
+                selectedArea = area
                 consecutiveBlankFrames = 0
                 translateManager.resetLastText()
 
@@ -173,12 +187,14 @@ class OverlayService : Service() {
                 DebugStore.selectedAreaY.value = y
                 DebugStore.selectedAreaW.value = w
                 DebugStore.selectedAreaH.value = h
+                DebugStore.selectedDisplayWidth.value = bounds.width()
+                DebugStore.selectedDisplayHeight.value = bounds.height()
+                DebugStore.selectedDisplayRotation.value = rotationDegrees(rotation)
 
                 rectangleSelectorView?.let(::removeViewSafely)
                 rectangleSelectorView = null
 
-                // Overlay uses ORIGINAL portrait coords (same space as the selector).
-                setupTranslationOverlay(x, y, w, h)
+                setupTranslationOverlay(area)
 
                 updateState(OverlayState.ACTIVE)
                 startCaptureLoop()
@@ -212,16 +228,21 @@ class OverlayService : Service() {
         updateState(if (selectedArea != null) OverlayState.PAUSED else OverlayState.IDLE)
     }
 
-    private fun setupTranslationOverlay(x: Int, y: Int, w: Int, h: Int) {
+    private fun setupTranslationOverlay(area: SelectedArea) {
         translationOverlayView?.let(::removeViewSafely)
         translationOverlayView = TranslationOverlayView(this)
 
-        // Overlay windows are composited in the game's landscape frame, so convert
-        // the portrait selection the same way the capture crop is converted.
-        val o = toOverlayRect(intArrayOf(x, y, w, h))
+        // The selector and translation window are both WindowManager overlays, so
+        // their coordinates already share the same space. Only the bitmap crop may
+        // need a rotation transform.
+        val bounds = displayBounds()
+        val safeX = area.x.coerceIn(0, (bounds.width() - 1).coerceAtLeast(0))
+        val safeY = area.y.coerceIn(0, (bounds.height() - 1).coerceAtLeast(0))
+        val safeWidth = area.width.coerceAtLeast(1)
+            .coerceAtMost((bounds.width() - safeX).coerceAtLeast(1))
 
         val transParams = WindowManager.LayoutParams(
-            o[2],
+            safeWidth,
             WindowManager.LayoutParams.WRAP_CONTENT,
             getLayoutFlag(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -232,10 +253,9 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
        ).apply {
             gravity = Gravity.TOP or Gravity.START
-            this.x = o[0]
-            this.y = o[1]
+            this.x = safeX
+            this.y = safeY
         }
-        translationOverlayParams = transParams
         translationOverlayView?.let { addViewSafely(it, transParams) }
     }
 
@@ -247,67 +267,121 @@ class OverlayService : Service() {
             delay(2000)
 
             while (isActive) {
-                if (currentState == OverlayState.ACTIVE) {
-                    screenCaptureManager.refreshDisplayGeometry()
-                    // Map the portrait selection into the landscape bitmap space.
-                    val area = selectedArea?.let { toBitmapRect(it) }
-                    if (area != null && area[2] > 0 && area[3] > 0) {
-                        try {
-                            val x = area[0]
-                            val y = area[1]
-                            val w = area[2]
-                            val h = area[3]
-
-                            DebugStore.captureStatus.value = "CAPTURING..."
-                            val bitmap = screenCaptureManager.captureRect(x, y, w, h)
-
-                            if (bitmap != null) {
-                                DebugStore.captureStatus.value = "OK"
-                                DebugStore.bitmapCaptured.value = true
-                                DebugStore.lastBitmap.value = bitmap
-
-                                val text = ocrManager.extractText(bitmap)
-                                DebugStore.ocrRawText.value = text
-                                DebugStore.ocrTextLength.value = text.length
-
-                                if (text.isNotBlank()) {
-                                    consecutiveBlankFrames = 0
-                                    if (DebugStore.enableTranslation.value) {
-                                        val translated = translateManager.translate(text)
-                                        DebugStore.translationResult.value = translated ?: "NULL"
-                                        withContext(Dispatchers.Main) {
-                                            translationOverlayView?.setText(
-                                                if (!translated.isNullOrBlank()) translated else ""
-                                            )
-                                        }
-                                    } else {
-                                        DebugStore.translationResult.value = "SKIPPED (OCR ONLY)"
-                                        withContext(Dispatchers.Main) {
-                                            translationOverlayView?.setText(text)
-                                        }
-                                    }
-                                } else {
-                                    consecutiveBlankFrames++
-                                    if (consecutiveBlankFrames >= 2) {
-                                        DebugStore.translationResult.value = ""
-                                        withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
-                                    }
-                                }
-                            } else {
-                                DebugStore.captureStatus.value = "FAIL"
-                                DebugStore.bitmapCaptured.value = false
-                            }
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            DebugStore.logError(e)
-                            e.printStackTrace()
-                        }
+                if (DebugStore.isActivityVisible) {
+                    DebugStore.captureStatus.value = "PAUSED (APP OPEN)"
+                    withContext(Dispatchers.Main) {
+                        translationOverlayView?.setCaptureHidden(true)
                     }
+                    delay(250)
+                    continue
+                }
+
+                val selection = selectedArea
+                if (currentState == OverlayState.ACTIVE && selection != null) {
+                    captureSelectedArea(selection)
                 } else {
-                    withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
+                    withContext(Dispatchers.Main) {
+                        translationOverlayView?.setText("")
+                        translationOverlayView?.setCaptureHidden(false)
+                    }
                 }
                 delay(1500)
+            }
+        }
+    }
+
+    private suspend fun captureSelectedArea(selection: SelectedArea) {
+        val (bitmapWidth, bitmapHeight) = screenCaptureManager.bitmapSize() ?: run {
+            DebugStore.captureStatus.value = "WAITING FOR FRAME"
+            return
+        }
+        DebugStore.captureFrameWidth.value = bitmapWidth
+        DebugStore.captureFrameHeight.value = bitmapHeight
+
+        val area = toBitmapRect(selection, bitmapWidth, bitmapHeight)
+        val cleanFrameBaseline = withContext(Dispatchers.Main) {
+            if (translationOverlayView?.hideForCapture() == true) {
+                screenCaptureManager.frameSequence()
+            } else {
+                null
+            }
+        }
+
+        if (cleanFrameBaseline != null && !awaitFrameAfter(cleanFrameBaseline)) {
+            DebugStore.captureStatus.value = "WAITING FOR CLEAN FRAME"
+            restoreTranslationOverlay(null)
+            return
+        }
+
+        var nextOverlayText: String? = null
+        try {
+            DebugStore.captureStatus.value = "CAPTURING..."
+            val bitmap = screenCaptureManager.captureRect(area[0], area[1], area[2], area[3])
+            if (bitmap == null) {
+                DebugStore.captureStatus.value = "FAIL"
+                DebugStore.bitmapCaptured.value = false
+                return
+            }
+
+            DebugStore.captureStatus.value = "OK"
+            DebugStore.bitmapCaptured.value = true
+            DebugStore.lastBitmap.value = bitmap
+
+            val text = ocrManager.extractText(bitmap)
+            DebugStore.ocrRawText.value = text
+            DebugStore.ocrTextLength.value = text.length
+
+            if (text.isNotBlank()) {
+                consecutiveBlankFrames = 0
+                if (DebugStore.enableTranslation.value) {
+                    val translated = translateManager.translate(text)
+                    DebugStore.translationResult.value = translated ?: "NULL"
+                    nextOverlayText = translated.orEmpty()
+                } else {
+                    DebugStore.translationResult.value = "SKIPPED (OCR ONLY)"
+                    nextOverlayText = text
+                }
+            } else {
+                consecutiveBlankFrames++
+                if (consecutiveBlankFrames >= 2) {
+                    DebugStore.translationResult.value = ""
+                    nextOverlayText = ""
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            DebugStore.logError(e)
+        } finally {
+            restoreTranslationOverlay(nextOverlayText)
+        }
+    }
+
+    private suspend fun awaitFrameAfter(sequence: Long): Boolean {
+        return withTimeoutOrNull(750L) {
+            while (screenCaptureManager.frameSequence() <= sequence) {
+                if (currentState != OverlayState.ACTIVE || DebugStore.isActivityVisible) {
+                    return@withTimeoutOrNull false
+                }
+                delay(16)
+            }
+            true
+        } ?: false
+    }
+
+    private suspend fun restoreTranslationOverlay(nextText: String?) {
+        withContext(Dispatchers.Main) {
+            val overlay = translationOverlayView ?: return@withContext
+            when {
+                DebugStore.isActivityVisible -> overlay.setCaptureHidden(true)
+                currentState == OverlayState.ACTIVE -> {
+                    nextText?.let(overlay::setText)
+                    overlay.setCaptureHidden(false)
+                }
+                else -> {
+                    overlay.setText("")
+                    overlay.setCaptureHidden(false)
+                }
             }
         }
     }
@@ -334,67 +408,30 @@ class OverlayService : Service() {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         screenCaptureManager.refreshDisplayGeometry()
-        if (currentState == OverlayState.SELECTING) {
-            cancelSelectionMode()
-        } else {
-            selectedArea?.let { setupTranslationOverlay(it[0], it[1], it[2], it[3]) }
+        rectangleSelectorView?.let(::removeViewSafely)
+        rectangleSelectorView = null
+        translationOverlayView?.setText("")
+        translationOverlayView?.setCaptureHidden(DebugStore.isActivityVisible)
+        updateState(if (selectedArea != null) OverlayState.PAUSED else OverlayState.IDLE)
+    }
+
+    private fun toBitmapRect(
+        selection: SelectedArea,
+        bitmapWidth: Int,
+        bitmapHeight: Int,
+    ): IntArray {
+        val quarterTurn = when (selection.displayRotation) {
+            Surface.ROTATION_90 -> QuarterTurn.CLOCKWISE
+            Surface.ROTATION_270 -> QuarterTurn.COUNTER_CLOCKWISE
+            else -> null
         }
-    }
-
-    /** Device portrait dimensions as (width, height); system stays portrait. */
-    private fun portraitSize(): Pair<Float, Float> {
-        val bounds = displayBounds()
-        return Pair(
-            minOf(bounds.width(), bounds.height()).toFloat(),
-            maxOf(bounds.width(), bounds.height()).toFloat(),
-        )
-    }
-
-    /**
-     * Rotate a rect from PORTRAIT window space into the force-landscape frame
-     * (size ph x pw). Used by BOTH the overlay placement and the capture crop so
-     * the two can never diverge. Result is [x, y, w, h] as floats.
-     *
-     * Default is 90° CCW, matching the on-device measurement
-     * (lx = y, ly = portraitWidth - x - w). If captures/overlay land 180°-off or
-     * mirrored, flip CLOCKWISE to true.
-     */
-    private fun rotatePortraitToLandscape(a: IntArray): FloatArray {
-        val (pw, ph) = portraitSize()
-        val x = a[0]; val y = a[1]; val w = a[2]; val h = a[3]
-        val rx: Float; val ry: Float
-        if (CLOCKWISE) {
-            rx = ph - (y + h)
-            ry = x.toFloat()
-        } else {
-            rx = y.toFloat()
-            ry = pw - (x + w)
-        }
-        return floatArrayOf(rx, ry, h.toFloat(), w.toFloat())
-    }
-
-    /** Overlay window position in the landscape frame (no scaling — window space). */
-    private fun toOverlayRect(a: IntArray): IntArray {
-        val r = rotatePortraitToLandscape(a)
-        return intArrayOf(r[0].toInt(), r[1].toInt(), r[2].toInt(), r[3].toInt())
-    }
-
-    /**
-     * Capture crop in ACTUAL bitmap pixels: same rotation as the overlay, then
-     * scaled from the portrait-derived landscape frame (ph x pw) to the real
-     * bitmap size in case they differ (nav bar, rounding, etc.).
-     */
-    private fun toBitmapRect(a: IntArray): IntArray {
-        val (bmpW, bmpH) = screenCaptureManager.bitmapSize() ?: return a
-        val (pw, ph) = portraitSize()
-        val r = rotatePortraitToLandscape(a)
-        val sx = bmpW / ph
-        val sy = bmpH / pw
-        return intArrayOf(
-            (r[0] * sx).toInt(),
-            (r[1] * sy).toInt(),
-            (r[2] * sx).toInt(),
-            (r[3] * sy).toInt()
+        return ScreenRegionMapper.map(
+            rect = selection.asRect(),
+            sourceWidth = selection.displayWidth,
+            sourceHeight = selection.displayHeight,
+            targetWidth = bitmapWidth,
+            targetHeight = bitmapHeight,
+            quarterTurn = quarterTurn,
         )
     }
 
@@ -449,7 +486,7 @@ class OverlayService : Service() {
 
     private fun displayBounds(): Rect {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            windowManager.maximumWindowMetrics.bounds
+            windowManager.currentWindowMetrics.bounds
         } else {
             @Suppress("DEPRECATION")
             val metrics = android.util.DisplayMetrics().also {
@@ -457,6 +494,16 @@ class OverlayService : Service() {
             }
             Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun displayRotation(): Int = windowManager.defaultDisplay.rotation
+
+    private fun rotationDegrees(rotation: Int): Int = when (rotation) {
+        Surface.ROTATION_90 -> 90
+        Surface.ROTATION_180 -> 180
+        Surface.ROTATION_270 -> 270
+        else -> 0
     }
 
     private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()

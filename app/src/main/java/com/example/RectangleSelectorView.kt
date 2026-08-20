@@ -186,7 +186,7 @@ class RectangleSelectorView(
 
     private fun displayBounds(): Rect {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            windowManager.maximumWindowMetrics.bounds
+            windowManager.currentWindowMetrics.bounds
         } else {
             @Suppress("DEPRECATION")
             val metrics = android.util.DisplayMetrics().also {

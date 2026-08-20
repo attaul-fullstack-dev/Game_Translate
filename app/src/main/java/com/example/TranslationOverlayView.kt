@@ -2,6 +2,7 @@ package com.example
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.view.View
 import android.widget.FrameLayout
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -61,12 +62,29 @@ class TranslationOverlayView(context: Context) : FrameLayout(context) {
                 }
             }
         }
-        addView(composeView)
+        addView(
+            composeView,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT),
+        )
     }
 
     fun setText(text: String) {
         textState.value = text
         visibleState.value = text.isNotBlank()
+    }
+
+    /**
+     * Hides the translated text before MediaProjection takes the next frame.
+     * Returns true when a newly captured frame is required to avoid OCR feedback.
+     */
+    fun hideForCapture(): Boolean {
+        val needsFreshFrame = visibility == View.VISIBLE && textState.value.isNotBlank()
+        if (needsFreshFrame) visibility = View.INVISIBLE
+        return needsFreshFrame
+    }
+
+    fun setCaptureHidden(hidden: Boolean) {
+        visibility = if (hidden) View.INVISIBLE else View.VISIBLE
     }
 
     override fun onDetachedFromWindow() {
