@@ -35,7 +35,8 @@ class RectangleSelectorView(
     context: Context,
     private val windowManager: WindowManager,
     private val onConfirm: (Int, Int, Int, Int) -> Unit,
-    private val onCancel: () -> Unit
+    private val onCancel: () -> Unit,
+    private val onWindowError: (Throwable) -> Unit,
 ) : FrameLayout(context) {
 
     private val lifecycleOwner = MyLifecycleOwner()
@@ -49,6 +50,7 @@ class RectangleSelectorView(
     private var initialTouchY = 0f
     private var initialWidth = 0
     private var initialHeight = 0
+    private var windowUpdateFailed = false
 
     init {
         lifecycleOwner.performRestore(null)
@@ -162,7 +164,7 @@ class RectangleSelectorView(
                     layoutParams.y = (initialY + (event.rawY - initialTouchY).toInt())
                         .coerceIn(0, (bounds.height() - layoutParams.height).coerceAtLeast(0))
                 }
-                windowManager.updateViewLayout(this, layoutParams)
+                updateWindowLayout(layoutParams)
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -176,6 +178,16 @@ class RectangleSelectorView(
     override fun onDetachedFromWindow() {
         lifecycleOwner.destroy()
         super.onDetachedFromWindow()
+    }
+
+    private fun updateWindowLayout(layoutParams: WindowManager.LayoutParams) {
+        if (windowUpdateFailed || !isAttachedToWindow) return
+        try {
+            windowManager.updateViewLayout(this, layoutParams)
+        } catch (failure: RuntimeException) {
+            windowUpdateFailed = true
+            onWindowError(failure)
+        }
     }
 
     private fun isInsideActionButtons(event: MotionEvent): Boolean {

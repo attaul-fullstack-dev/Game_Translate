@@ -31,6 +31,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -98,6 +99,8 @@ class MainActivity : ComponentActivity() {
                     translateManager.downloadModelsIfNeeded()
                     isModelDownloaded = true
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 modelError = e.localizedMessage ?: "Model terjemahan gagal disiapkan."
             } finally {
@@ -235,6 +238,8 @@ class MainActivity : ComponentActivity() {
                                                 try {
                                                     translateManager.downloadModelsIfNeeded()
                                                     isModelDownloaded = true
+                                                } catch (e: CancellationException) {
+                                                    throw e
                                                 } catch (e: Exception) {
                                                     Toast.makeText(this@MainActivity, "Download gagal", Toast.LENGTH_SHORT).show()
                                                 } finally {
@@ -341,14 +346,17 @@ class MainActivity : ComponentActivity() {
                                             try {
                                                 translateManager.resetLastText()
                                                 val res = translateManager.translate("Hello")
-                                                testResult = res ?: "Tidak ada hasil (atau teks sama)"
+                                                testResult = res ?: "Tidak ada hasil"
                                                 testError = ""
+                                            } catch (e: CancellationException) {
+                                                throw e
                                             } catch (e: Exception) {
                                                 testResult = ""
                                                 testError = e.localizedMessage ?: "Unknown Error"
                                             }
                                         }
                                     },
+                                    enabled = isModelDownloaded && !isDownloading,
                                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                                     shape = RoundedCornerShape(8.dp)
                                 ) {
@@ -603,8 +611,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStart() {
-        super.onStart()
         DebugStore.isActivityVisible = true
+        super.onStart()
     }
 
     override fun onStop() {
@@ -648,14 +656,23 @@ class MainActivity : ComponentActivity() {
             putExtra(OverlayService.EXTRA_RESULT_CODE, resultCode)
             putExtra(OverlayService.EXTRA_DATA, data)
         }
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+            // Keep the capture grant's Activity task alive, but put the game back
+            // in front so MediaProjection does not immediately OCR this app.
+            moveTaskToBack(true)
+        } catch (failure: RuntimeException) {
+            DebugStore.logError(failure)
+            Toast.makeText(
+                this,
+                "Translator gagal dijalankan: " +
+                    (failure.localizedMessage ?: "layanan diblokir sistem"),
+                Toast.LENGTH_LONG,
+            ).show()
         }
-        // Move to background instead of finish() so the activity (and its
-        // MediaProjection result) is not torn down — finishing here can cause the
-        // projection to capture our own (now closing) task instead of the game.
-        moveTaskToBack(true)
     }
 }

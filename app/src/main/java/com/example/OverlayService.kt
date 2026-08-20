@@ -26,6 +26,12 @@ class OverlayService : Service() {
         const val ACTION_STOP = "com.aistudio.gametranslator.action.STOP"
         const val EXTRA_RESULT_CODE = "RESULT_CODE"
         const val EXTRA_DATA = "DATA"
+
+        private const val TOUCH_THROUGH_ALPHA = 0.79f
+        private const val FRAME_WAIT_TIMEOUT_MS = 1_250L
+        private const val OCR_TIMEOUT_MS = 5_000L
+        private const val TRANSLATION_TIMEOUT_MS = 8_000L
+        private const val APP_SWITCH_SETTLE_MS = 500L
     }
 
     private data class SelectedArea(
@@ -36,6 +42,7 @@ class OverlayService : Service() {
         val displayWidth: Int,
         val displayHeight: Int,
         val displayRotation: Int,
+        val epoch: Long,
     ) {
         fun asRect(): IntArray = intArrayOf(x, y, width, height)
     }
@@ -50,13 +57,17 @@ class OverlayService : Service() {
     private var controlBarView: ControlBarView? = null
 
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
+    private val captureEpoch = CaptureEpoch()
     private var captureJob: Job? = null
+    @Volatile
+    private var captureAttemptJob: Job? = null
 
     @Volatile
     private var currentState = OverlayState.IDLE
     @Volatile
     private var selectedArea: SelectedArea? = null
     private var consecutiveBlankFrames = 0
+    private var activityWasVisible = false
 
     override fun onCreate() {
         super.onCreate()
@@ -77,13 +88,24 @@ class OverlayService : Service() {
             return START_NOT_STICKY
         }
 
-        DebugStore.serviceState.value = "RUNNING"
-        val notification = createNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(1, notification)
+        try {
+            val notification = createNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    1,
+                    notification,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
+                )
+            } else {
+                startForeground(1, notification)
+            }
+        } catch (failure: RuntimeException) {
+            DebugStore.serviceState.value = "STOPPED"
+            DebugStore.logError(failure)
+            stopSelf()
+            return START_NOT_STICKY
         }
+        DebugStore.serviceState.value = "RUNNING"
 
         if (!PermissionHelper.hasOverlayPermission(this)) {
             DebugStore.lastError.value = "Izin overlay tidak tersedia."
@@ -105,6 +127,7 @@ class OverlayService : Service() {
             screenCaptureManager.start(resultCode, data)
             setupControlBar()
             updateState(OverlayState.IDLE)
+            startCaptureLoop()
         } catch (e: Exception) {
             DebugStore.logError(e)
             stopSelf()
@@ -128,6 +151,7 @@ class OverlayService : Service() {
             windowManager = windowManager,
             onBubbleTap = ::handleBubbleTap,
             onBubbleLongPress = ::reselectArea,
+            onWindowError = ::handleOverlayWindowError,
         )
         val bounds = displayBounds()
         val bubbleMargin = dpToPx(16)
@@ -148,20 +172,22 @@ class OverlayService : Service() {
     }
 
     private fun handleBubbleTap() {
-        when (currentState) {
-            OverlayState.IDLE -> startSelectionMode()
-            OverlayState.ACTIVE -> {
+        when (OverlayInteractionPolicy.actionFor(currentState)) {
+            BubbleTapAction.START_SELECTION -> startSelectionMode()
+            BubbleTapAction.PAUSE -> {
+                invalidateCaptureWork()
+                removeTranslationOverlay()
                 updateState(OverlayState.PAUSED)
-                translationOverlayView?.setText("")
             }
-            OverlayState.PAUSED -> startSelectionMode()
-            OverlayState.SELECTING -> cancelSelectionMode()
+            BubbleTapAction.CANCEL_SELECTION -> cancelSelectionMode()
         }
     }
 
     private fun startSelectionMode() {
-        translationOverlayView?.setText("")
-        translationOverlayView?.setCaptureHidden(false)
+        invalidateCaptureWork()
+        rectangleSelectorView?.let(::removeViewSafely)
+        rectangleSelectorView = null
+        removeTranslationOverlay()
         updateState(OverlayState.SELECTING)
 
         rectangleSelectorView = RectangleSelectorView(
@@ -170,6 +196,7 @@ class OverlayService : Service() {
             onConfirm = { x, y, w, h ->
                 val bounds = displayBounds()
                 val rotation = displayRotation()
+                val epoch = captureEpoch.next()
                 val area = SelectedArea(
                     x = x,
                     y = y,
@@ -178,6 +205,7 @@ class OverlayService : Service() {
                     displayWidth = bounds.width(),
                     displayHeight = bounds.height(),
                     displayRotation = rotation,
+                    epoch = epoch,
                 )
                 selectedArea = area
                 consecutiveBlankFrames = 0
@@ -199,7 +227,8 @@ class OverlayService : Service() {
                 updateState(OverlayState.ACTIVE)
                 startCaptureLoop()
             },
-            onCancel = { cancelSelectionMode() }
+            onCancel = { cancelSelectionMode() },
+            onWindowError = ::handleOverlayWindowError,
         )
 
         val bounds = displayBounds()
@@ -255,6 +284,7 @@ class OverlayService : Service() {
             gravity = Gravity.TOP or Gravity.START
             this.x = safeX
             this.y = safeY
+            alpha = TOUCH_THROUGH_ALPHA
         }
         translationOverlayView?.let { addViewSafely(it, transParams) }
     }
@@ -263,114 +293,271 @@ class OverlayService : Service() {
         if (captureJob?.isActive == true) return
 
         captureJob = scope.launch(Dispatchers.Default) {
-            // Beri waktu user pindah ke game
+            // Give Android time to put the game back in front.
             delay(2000)
 
             while (isActive) {
-                if (DebugStore.isActivityVisible) {
-                    DebugStore.captureStatus.value = "PAUSED (APP OPEN)"
-                    withContext(Dispatchers.Main) {
-                        translationOverlayView?.setCaptureHidden(true)
+                if (!PermissionHelper.hasOverlayPermission(this@OverlayService)) {
+                    withContext(Dispatchers.Main.immediate) {
+                        handleOverlayPermissionLost()
                     }
+                    break
+                }
+
+                if (DebugStore.isActivityVisible) {
+                    if (!activityWasVisible) {
+                        activityWasVisible = true
+                        withContext(Dispatchers.Main.immediate) {
+                            invalidateCaptureWork(keepSelection = true)
+                            consecutiveBlankFrames = 0
+                            screenCaptureManager.resetBitmap()
+                            rectangleSelectorView?.let(::removeViewSafely)
+                            rectangleSelectorView = null
+                            if (currentState == OverlayState.SELECTING) {
+                                updateState(
+                                    if (selectedArea != null) OverlayState.PAUSED
+                                    else OverlayState.IDLE,
+                                )
+                            }
+                            translationOverlayView?.setCaptureHidden(true)
+                        }
+                    }
+                    DebugStore.captureStatus.value = "PAUSED (APP OPEN)"
                     delay(250)
                     continue
                 }
 
+                if (activityWasVisible) {
+                    activityWasVisible = false
+                    DebugStore.captureStatus.value = "WAITING FOR GAME"
+                    delay(APP_SWITCH_SETTLE_MS)
+                    if (DebugStore.isActivityVisible) continue
+                }
+
                 val selection = selectedArea
                 if (currentState == OverlayState.ACTIVE && selection != null) {
-                    captureSelectedArea(selection)
-                } else {
-                    withContext(Dispatchers.Main) {
-                        translationOverlayView?.setText("")
-                        translationOverlayView?.setCaptureHidden(false)
+                    val attempt = launch {
+                        try {
+                            captureSelectedArea(selection)
+                        } catch (failure: CancellationException) {
+                            throw failure
+                        } catch (failure: Exception) {
+                            withContext(Dispatchers.Main.immediate) {
+                                if (isCurrentSelection(selection)) {
+                                    DebugStore.captureStatus.value = "ERROR"
+                                    DebugStore.logError(failure)
+                                }
+                            }
+                        }
                     }
+                    captureAttemptJob = attempt
+                    try {
+                        while (attempt.isActive) {
+                            if (DebugStore.isActivityVisible ||
+                                currentState != OverlayState.ACTIVE ||
+                                selectedArea?.epoch != selection.epoch
+                            ) {
+                                attempt.cancel()
+                            }
+                            delay(25)
+                        }
+                        attempt.join()
+                    } finally {
+                        if (captureAttemptJob === attempt) {
+                            captureAttemptJob = null
+                        }
+                    }
+                    waitForNextCapture(selection.epoch)
+                } else {
+                    delay(250)
                 }
-                delay(1500)
+            }
+        }
+    }
+
+    private suspend fun waitForNextCapture(epoch: Long) {
+        withTimeoutOrNull(1_500L) {
+            while (currentState == OverlayState.ACTIVE &&
+                selectedArea?.epoch == epoch &&
+                !DebugStore.isActivityVisible
+            ) {
+                delay(50)
             }
         }
     }
 
     private suspend fun captureSelectedArea(selection: SelectedArea) {
-        val (bitmapWidth, bitmapHeight) = screenCaptureManager.bitmapSize() ?: run {
-            DebugStore.captureStatus.value = "WAITING FOR FRAME"
-            return
-        }
-        DebugStore.captureFrameWidth.value = bitmapWidth
-        DebugStore.captureFrameHeight.value = bitmapHeight
+        if (!isCurrentSelection(selection)) return
 
-        val area = toBitmapRect(selection, bitmapWidth, bitmapHeight)
-        val cleanFrameBaseline = withContext(Dispatchers.Main) {
-            if (translationOverlayView?.hideForCapture() == true) {
-                screenCaptureManager.frameSequence()
-            } else {
+        val overlayWasVisible = withContext(Dispatchers.Main.immediate) {
+            if (!isCurrentSelection(selection)) {
                 null
+            } else {
+                translationOverlayView?.hideForCapture() == true
             }
-        }
+        } ?: return
 
-        if (cleanFrameBaseline != null && !awaitFrameAfter(cleanFrameBaseline)) {
-            DebugStore.captureStatus.value = "WAITING FOR CLEAN FRAME"
-            restoreTranslationOverlay(null)
+        if (!isCurrentSelection(selection)) return
+        val request = screenCaptureManager.requestFreshFrames(
+            count = if (overlayWasVisible) 2 else 1,
+        )
+        if (request == null) {
+            updateIfCurrent(selection) {
+                DebugStore.captureStatus.value = "WAITING FOR FRAME"
+            }
+            restoreTranslationOverlay(selection, null)
             return
         }
+
+        if (!awaitFrameRequest(request, selection)) {
+            updateIfCurrent(selection) {
+                DebugStore.captureStatus.value = "WAITING FOR CLEAN FRAME"
+            }
+            restoreTranslationOverlay(selection, null)
+            return
+        }
+
+        if (!isCurrentSelection(selection)) return
+        val (bitmapWidth, bitmapHeight) = screenCaptureManager.bitmapSize() ?: run {
+            updateIfCurrent(selection) {
+                DebugStore.captureStatus.value = "WAITING FOR FRAME"
+            }
+            restoreTranslationOverlay(selection, null)
+            return
+        }
+        if (!updateIfCurrent(selection) {
+                DebugStore.captureFrameWidth.value = bitmapWidth
+                DebugStore.captureFrameHeight.value = bitmapHeight
+            }
+        ) return
+        val area = toBitmapRect(selection, bitmapWidth, bitmapHeight)
 
         var nextOverlayText: String? = null
         try {
-            DebugStore.captureStatus.value = "CAPTURING..."
+            if (!updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "CAPTURING..."
+                }
+            ) return
+
             val bitmap = screenCaptureManager.captureRect(area[0], area[1], area[2], area[3])
             if (bitmap == null) {
-                DebugStore.captureStatus.value = "FAIL"
-                DebugStore.bitmapCaptured.value = false
+                updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "FAIL"
+                    DebugStore.bitmapCaptured.value = false
+                }
                 return
             }
 
-            DebugStore.captureStatus.value = "OK"
-            DebugStore.bitmapCaptured.value = true
-            DebugStore.lastBitmap.value = bitmap
-
-            val text = ocrManager.extractText(bitmap)
-            DebugStore.ocrRawText.value = text
-            DebugStore.ocrTextLength.value = text.length
-
-            if (text.isNotBlank()) {
-                consecutiveBlankFrames = 0
-                if (DebugStore.enableTranslation.value) {
-                    val translated = translateManager.translate(text)
-                    DebugStore.translationResult.value = translated ?: "NULL"
-                    nextOverlayText = translated.orEmpty()
-                } else {
-                    DebugStore.translationResult.value = "SKIPPED (OCR ONLY)"
-                    nextOverlayText = text
+            if (!updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "OCR..."
                 }
-            } else {
-                consecutiveBlankFrames++
-                if (consecutiveBlankFrames >= 2) {
-                    DebugStore.translationResult.value = ""
-                    nextOverlayText = ""
+            ) return
+
+            val ocr = withTimeoutOrNull(OCR_TIMEOUT_MS) {
+                ocrManager.extractText(bitmap)
+            }
+            if (ocr == null) {
+                updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "OCR TIMEOUT"
+                    DebugStore.bitmapCaptured.value = false
+                }
+                return
+            }
+
+            val text = ocr.text
+            var shouldTranslate = false
+            if (!updateIfCurrent(selection) {
+                    DebugStore.bitmapCaptured.value = true
+                    DebugStore.lastBitmap.value = bitmap
+                    DebugStore.ocrRawText.value = text
+                    DebugStore.ocrTextLength.value = text.length
+                    DebugStore.detectedBlocks.value = ocr.blockCount
+                    DebugStore.detectedLines.value = ocr.lineCount
+
+                    if (text.isNotBlank()) {
+                        consecutiveBlankFrames = 0
+                        if (DebugStore.enableTranslation.value) {
+                            shouldTranslate = true
+                            DebugStore.captureStatus.value = "TRANSLATING..."
+                        } else {
+                            DebugStore.translationResult.value = "SKIPPED (OCR ONLY)"
+                            nextOverlayText = text
+                            DebugStore.captureStatus.value = "OK"
+                        }
+                    } else {
+                        consecutiveBlankFrames++
+                        DebugStore.captureStatus.value = "NO TEXT"
+                        if (consecutiveBlankFrames >= 2) {
+                            DebugStore.translationResult.value = ""
+                            nextOverlayText = ""
+                        }
+                    }
+                }
+            ) return
+
+            if (shouldTranslate) {
+                val translated = withTimeoutOrNull(TRANSLATION_TIMEOUT_MS) {
+                    translateManager.translate(text)
+                }
+                if (translated == null) {
+                    updateIfCurrent(selection) {
+                        DebugStore.captureStatus.value = "TRANSLATION TIMEOUT"
+                        DebugStore.translationResult.value = "TIMEOUT"
+                    }
+                    return
+                }
+                updateIfCurrent(selection) {
+                    DebugStore.translationResult.value = translated
+                    nextOverlayText = translated
+                    DebugStore.captureStatus.value = "OK"
                 }
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            DebugStore.logError(e)
+            withContext(Dispatchers.Main.immediate) {
+                if (isCurrentSelection(selection)) {
+                    DebugStore.captureStatus.value = "ERROR"
+                    DebugStore.logError(e)
+                }
+            }
         } finally {
-            restoreTranslationOverlay(nextOverlayText)
+            // ML Kit Tasks are not cancellable at the native layer. Do not recycle
+            // this bitmap here: a timed-out task may still be reading it.
+            restoreTranslationOverlay(selection, nextOverlayText)
         }
     }
 
-    private suspend fun awaitFrameAfter(sequence: Long): Boolean {
-        return withTimeoutOrNull(750L) {
-            while (screenCaptureManager.frameSequence() <= sequence) {
-                if (currentState != OverlayState.ACTIVE || DebugStore.isActivityVisible) {
-                    return@withTimeoutOrNull false
+    private suspend fun awaitFrameRequest(
+        request: FrameRequest,
+        selection: SelectedArea,
+    ): Boolean {
+        return try {
+            val reachedTarget = withTimeoutOrNull(FRAME_WAIT_TIMEOUT_MS) {
+                while (screenCaptureManager.frameSequence() < request.target) {
+                    if (!isCurrentSelection(selection)) {
+                        return@withTimeoutOrNull false
+                    }
+                    delay(16)
                 }
-                delay(16)
+                true
             }
-            true
-        } ?: false
+            when {
+                reachedTarget == true -> true
+                !isCurrentSelection(selection) -> false
+                else -> screenCaptureManager.frameSequence() > request.baseline
+            }
+        } finally {
+            screenCaptureManager.cancelPendingFrameRequests()
+        }
     }
 
-    private suspend fun restoreTranslationOverlay(nextText: String?) {
-        withContext(Dispatchers.Main) {
+    private suspend fun restoreTranslationOverlay(
+        selection: SelectedArea,
+        nextText: String?,
+    ) {
+        withContext(Dispatchers.Main.immediate) {
+            if (!ownsSelection(selection)) return@withContext
             val overlay = translationOverlayView ?: return@withContext
             when {
                 DebugStore.isActivityVisible -> overlay.setCaptureHidden(true)
@@ -386,9 +573,36 @@ class OverlayService : Service() {
         }
     }
 
+    private fun ownsSelection(selection: SelectedArea): Boolean {
+        return captureEpoch.matches(selection.epoch) &&
+            selectedArea?.epoch == selection.epoch
+    }
+
+    private fun isCurrentSelection(selection: SelectedArea): Boolean {
+        return ownsSelection(selection) &&
+            currentState == OverlayState.ACTIVE &&
+            !DebugStore.isActivityVisible
+    }
+
+    private suspend fun updateIfCurrent(
+        selection: SelectedArea,
+        update: () -> Unit,
+    ): Boolean {
+        return withContext(Dispatchers.Main.immediate) {
+            if (!isCurrentSelection(selection)) {
+                false
+            } else {
+                update()
+                true
+            }
+        }
+    }
+
     override fun onDestroy() {
-        super.onDestroy()
         DebugStore.serviceState.value = "STOPPED"
+        captureEpoch.next()
+        screenCaptureManager.cancelPendingFrameRequests()
+        captureAttemptJob?.cancel()
         captureJob?.cancel()
         scope.cancel()
 
@@ -399,19 +613,39 @@ class OverlayService : Service() {
         translationOverlayView = null
         controlBarView = null
 
-        screenCaptureManager.stop()
-        ocrManager.close()
-        translateManager.close()
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        try {
+            screenCaptureManager.stop()
+        } catch (failure: RuntimeException) {
+            DebugStore.logError(failure)
+        }
+        try {
+            ocrManager.close()
+        } catch (failure: RuntimeException) {
+            DebugStore.logError(failure)
+        }
+        try {
+            translateManager.close()
+        } catch (failure: RuntimeException) {
+            DebugStore.logError(failure)
+        }
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } catch (failure: RuntimeException) {
+            DebugStore.logError(failure)
+        }
+        super.onDestroy()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        invalidateCaptureWork()
         screenCaptureManager.refreshDisplayGeometry()
         rectangleSelectorView?.let(::removeViewSafely)
         rectangleSelectorView = null
-        translationOverlayView?.setText("")
-        translationOverlayView?.setCaptureHidden(DebugStore.isActivityVisible)
+        removeTranslationOverlay()
+        controlBarView?.let(::removeViewSafely)
+        controlBarView = null
+        setupControlBar()
         updateState(if (selectedArea != null) OverlayState.PAUSED else OverlayState.IDLE)
     }
 
@@ -480,8 +714,33 @@ class OverlayService : Service() {
 
     private fun reselectArea() {
         if (currentState == OverlayState.SELECTING) return
-        translationOverlayView?.setText("")
         startSelectionMode()
+    }
+
+    private fun invalidateCaptureWork(keepSelection: Boolean = false) {
+        val epoch = captureEpoch.next()
+        if (keepSelection) {
+            selectedArea = selectedArea?.copy(epoch = epoch)
+        }
+        captureAttemptJob?.cancel()
+        screenCaptureManager.cancelPendingFrameRequests()
+    }
+
+    private fun removeTranslationOverlay() {
+        translationOverlayView?.let(::removeViewSafely)
+        translationOverlayView = null
+    }
+
+    private fun handleOverlayPermissionLost() {
+        DebugStore.captureStatus.value = "STOPPED"
+        DebugStore.logMessage("Izin tampil di atas aplikasi lain telah dicabut.")
+        stopSelf()
+    }
+
+    private fun handleOverlayWindowError(failure: Throwable) {
+        DebugStore.captureStatus.value = "STOPPED"
+        DebugStore.logError(failure)
+        stopSelf()
     }
 
     private fun displayBounds(): Rect {
@@ -512,8 +771,7 @@ class OverlayService : Service() {
         try {
             windowManager.addView(view, params)
         } catch (e: Exception) {
-            DebugStore.logError(e)
-            stopSelf()
+            handleOverlayWindowError(e)
         }
     }
 
@@ -522,6 +780,8 @@ class OverlayService : Service() {
             if (view.isAttachedToWindow) windowManager.removeView(view)
         } catch (e: IllegalArgumentException) {
             // The system may already have detached overlay windows during teardown.
+        } catch (e: RuntimeException) {
+            DebugStore.logError(e)
         }
     }
 }

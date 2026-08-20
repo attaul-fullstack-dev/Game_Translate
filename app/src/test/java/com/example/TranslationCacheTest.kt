@@ -1,19 +1,17 @@
 package com.example
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TranslationCacheTest {
     @Test
-    fun `similar OCR frame reuses successful translation`() {
+    fun `same normalized OCR text reuses successful translation`() {
         val cache = TranslationCache()
         cache.put("Open the ancient door", "Buka pintu kuno")
 
         assertEquals("Buka pintu kuno", cache.get("  open  the ancient door "))
-        assertEquals("Buka pintu kuno", cache.get("Open the ancient do0r"))
+        assertNull(cache.get("Open the ancient do0r"))
     }
 
     @Test
@@ -34,9 +32,11 @@ class TranslationCacheTest {
     }
 
     @Test
-    fun `similarity handles whitespace case and empty input`() {
-        assertTrue(TextSimilarity.isSimilar("NEW   GAME", "new game"))
-        assertFalse(TextSimilarity.isSimilar("", ""))
-        assertFalse(TextSimilarity.isSimilar("Save game", "Load game"))
+    fun `semantic changes never reuse a cached translation`() {
+        val cache = TranslationCache()
+        cache.put("The door is locked", "Pintunya terkunci")
+
+        assertNull(cache.get("The door is unlocked"))
+        assertNull(cache.get("The door is lock3d"))
     }
 }

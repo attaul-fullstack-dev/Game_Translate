@@ -6,25 +6,27 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.tasks.await
 
-class OcrManager {
+internal data class OcrSnapshot(
+    val text: String,
+    val blockCount: Int,
+    val lineCount: Int,
+)
+
+internal class OcrManager {
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
-    suspend fun extractText(bitmap: Bitmap): String {
+    suspend fun extractText(bitmap: Bitmap): OcrSnapshot {
         val image = InputImage.fromBitmap(bitmap, 0)
-        return try {
-            val result = recognizer.process(image).await()
-            DebugStore.detectedBlocks.value = result.textBlocks.size
-            var lines = 0
-            for (block in result.textBlocks) {
-                lines += block.lines.size
-            }
-            DebugStore.detectedLines.value = lines
-            
-            result.text
-        } catch (e: Exception) {
-            DebugStore.logError(e)
-            throw e
+        val result = recognizer.process(image).await()
+        var lines = 0
+        for (block in result.textBlocks) {
+            lines += block.lines.size
         }
+        return OcrSnapshot(
+            text = result.text,
+            blockCount = result.textBlocks.size,
+            lineCount = lines,
+        )
     }
 
     fun close() {

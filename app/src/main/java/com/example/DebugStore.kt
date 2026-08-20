@@ -62,4 +62,9 @@ object DebugStore {
         Log.e("TranslationAppError", "Error caught: $errorString")
         lastError.value = errorString
     }
+
+    fun logMessage(message: String) {
+        Log.e("TranslationAppError", message)
+        lastError.value = message
+    }
 }

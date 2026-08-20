@@ -34,18 +34,12 @@ class TranslateManager {
         val trimmedText = text.trim()
         if (trimmedText.isEmpty()) return null
 
-        // Preserve the previous successful result while adjacent OCR frames only
-        // differ by anti-aliasing or whitespace noise. Returning null here used to
-        // make OverlayService clear the text on every second frame.
+        // Only exact normalized OCR text is cached. Similar-looking phrases can
+        // have opposite meanings (for example "locked" and "unlocked").
         translationCache.get(trimmedText)?.let { return it }
 
-        return try {
-            translator.translate(trimmedText).await().also { translated ->
-                translationCache.put(trimmedText, translated)
-            }
-        } catch (e: Exception) {
-            DebugStore.logError(e)
-            throw e
+        return translator.translate(trimmedText).await().also { translated ->
+            translationCache.put(trimmedText, translated)
         }
     }
 
