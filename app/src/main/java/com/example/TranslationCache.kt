@@ -2,27 +2,35 @@ package com.example
 
 import java.util.Locale
 
-/** Keeps a successful translation only for the same normalized OCR text. */
-internal class TranslationCache {
-    private var sourceText = ""
-    private var translatedText: String? = null
+/** Small LRU cache so unchanged OCR blocks are never translated repeatedly. */
+internal class TranslationCache(
+    private val maxEntries: Int = 64,
+) {
+    private val translations = object : LinkedHashMap<String, String>(
+        maxEntries,
+        0.75f,
+        true,
+    ) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<String, String>?,
+        ): Boolean = size > maxEntries
+    }
 
-    @Synchronized
-    fun get(source: String): String? {
-        val cached = translatedText ?: return null
-        return if (normalize(source) == sourceText) cached else null
+    init {
+        require(maxEntries > 0) { "maxEntries must be positive" }
     }
 
     @Synchronized
+    fun get(source: String): String? = translations[normalize(source)]
+
+    @Synchronized
     fun put(source: String, translation: String) {
-        sourceText = normalize(source)
-        translatedText = translation
+        translations[normalize(source)] = translation
     }
 
     @Synchronized
     fun clear() {
-        sourceText = ""
-        translatedText = null
+        translations.clear()
     }
 
     private fun normalize(text: String): String =

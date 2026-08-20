@@ -39,4 +39,27 @@ class TranslationCacheTest {
         assertNull(cache.get("The door is unlocked"))
         assertNull(cache.get("The door is lock3d"))
     }
+
+    @Test
+    fun `multiple unchanged OCR blocks remain cached independently`() {
+        val cache = TranslationCache()
+        cache.put("PLAY", "Mainkan")
+        cache.put("HELP & OPTIONS", "Bantuan & Opsi")
+
+        assertEquals("Mainkan", cache.get("play"))
+        assertEquals("Bantuan & Opsi", cache.get("help & options"))
+    }
+
+    @Test
+    fun `least recently used translation is evicted at capacity`() {
+        val cache = TranslationCache(maxEntries = 2)
+        cache.put("PLAY", "Mainkan")
+        cache.put("EPISODES", "Episode")
+        cache.get("PLAY")
+        cache.put("OPTIONS", "Opsi")
+
+        assertEquals("Mainkan", cache.get("PLAY"))
+        assertNull(cache.get("EPISODES"))
+        assertEquals("Opsi", cache.get("OPTIONS"))
+    }
 }
