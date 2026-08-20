@@ -60,6 +60,21 @@ class OcrStabilityTrackerTest {
     }
 
     @Test
+    fun `same text moved to another location updates overlay position`() {
+        val tracker = OcrStabilityTracker()
+        val original = listOf(region("CONTINUE", left = 100, top = 100))
+        val moved = listOf(region("CONTINUE", left = 420, top = 240))
+        tracker.observe(original)
+        tracker.observe(original)
+
+        assertEquals(
+            OcrUpdateDecision.WAITING_FOR_STABLE_TEXT,
+            tracker.observe(moved),
+        )
+        assertEquals(OcrUpdateDecision.CHANGED, tracker.observe(moved))
+    }
+
+    @Test
     fun `overlay only clears after two blank frames`() {
         val tracker = OcrStabilityTracker()
         val help = listOf(region("HELP & OPTIONS"))

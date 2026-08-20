@@ -17,28 +17,30 @@ internal class OcrManager {
         for (block in result.textBlocks) {
             lines += block.lines.size
         }
-        val regions = result.textBlocks.mapNotNull { block ->
-            val text = block.text.trim()
-            if (text.isEmpty()) return@mapNotNull null
+        val rawRegions = result.textBlocks.flatMap { block ->
+            block.lines.mapNotNull { line ->
+                val text = line.text.trim()
+                if (text.isEmpty()) return@mapNotNull null
 
-            val boundingBox = block.boundingBox ?: unionOf(
-                block.lines.mapNotNull { it.boundingBox },
-            ) ?: return@mapNotNull null
-            OcrTextRegion(
-                text = text,
-                bounds = OcrBounds(
-                    left = boundingBox.left,
-                    top = boundingBox.top,
-                    right = boundingBox.right,
-                    bottom = boundingBox.bottom,
-                ),
-            )
+                val boundingBox = line.boundingBox ?: unionOf(
+                    line.elements.mapNotNull { it.boundingBox },
+                ) ?: return@mapNotNull null
+                OcrTextRegion(
+                    text = text,
+                    bounds = OcrBounds(
+                        left = boundingBox.left,
+                        top = boundingBox.top,
+                        right = boundingBox.right,
+                        bottom = boundingBox.bottom,
+                    ),
+                )
+            }
         }.sortedWith(
             compareBy<OcrTextRegion> { it.bounds.top }
                 .thenBy { it.bounds.left },
         )
-        val positionedRegions = if (regions.isNotEmpty() || result.text.isBlank()) {
-            regions
+        val positionedRegions = if (rawRegions.isNotEmpty() || result.text.isBlank()) {
+            rawRegions
         } else {
             listOf(
                 OcrTextRegion(
@@ -52,7 +54,6 @@ internal class OcrManager {
                 ),
             )
         }
-
         return OcrSnapshot(
             text = positionedRegions.joinToString(separator = "\n") { it.text },
             blockCount = result.textBlocks.size,

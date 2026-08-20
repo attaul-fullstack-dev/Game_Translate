@@ -29,6 +29,7 @@ class OverlayService : Service() {
 
         private const val TOUCH_THROUGH_ALPHA = 0.79f
         private const val FRAME_WAIT_TIMEOUT_MS = 1_250L
+        private const val OVERLAY_HIDDEN_FRAME_WAIT_TIMEOUT_MS = 150L
         private const val OCR_TIMEOUT_MS = 5_000L
         private const val TRANSLATION_TIMEOUT_MS = 8_000L
         private const val APP_SWITCH_SETTLE_MS = 500L
@@ -59,6 +60,8 @@ class OverlayService : Service() {
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
     private val captureEpoch = CaptureEpoch()
     private val ocrStabilityTracker = OcrStabilityTracker()
+    @Volatile
+    private var nextCaptureDelayMs = CaptureCadencePolicy.NORMAL_INTERVAL_MS
     private var captureJob: Job? = null
     @Volatile
     private var captureAttemptJob: Job? = null
@@ -210,6 +213,7 @@ class OverlayService : Service() {
                 selectedArea = area
                 ocrStabilityTracker.reset()
                 translateManager.resetLastText()
+                nextCaptureDelayMs = CaptureCadencePolicy.NORMAL_INTERVAL_MS
 
                 DebugStore.selectedAreaX.value = x
                 DebugStore.selectedAreaY.value = y
@@ -299,7 +303,7 @@ class OverlayService : Service() {
 
         captureJob = scope.launch(Dispatchers.Default) {
             // Give Android time to put the game back in front.
-            delay(2000)
+            delay(CaptureCadencePolicy.INITIAL_SETTLE_MS)
 
             while (isActive) {
                 if (!PermissionHelper.hasOverlayPermission(this@OverlayService)) {
@@ -380,7 +384,8 @@ class OverlayService : Service() {
     }
 
     private suspend fun waitForNextCapture(epoch: Long) {
-        withTimeoutOrNull(1_500L) {
+        val delayMs = nextCaptureDelayMs
+        withTimeoutOrNull(delayMs) {
             while (currentState == OverlayState.ACTIVE &&
                 selectedArea?.epoch == epoch &&
                 !DebugStore.isActivityVisible
@@ -393,7 +398,7 @@ class OverlayService : Service() {
     private suspend fun captureSelectedArea(selection: SelectedArea) {
         if (!isCurrentSelection(selection)) return
 
-        val overlayWasVisible = withContext(Dispatchers.Main.immediate) {
+        val overlayWasHidden = withContext(Dispatchers.Main.immediate) {
             if (!isCurrentSelection(selection)) {
                 null
             } else {
@@ -401,43 +406,43 @@ class OverlayService : Service() {
             }
         } ?: return
 
-        if (!isCurrentSelection(selection)) return
-        val request = screenCaptureManager.requestFreshFrames(
-            count = if (overlayWasVisible) 2 else 1,
-        )
-        if (request == null) {
-            updateIfCurrent(selection) {
-                DebugStore.captureStatus.value = "WAITING FOR FRAME"
-            }
-            restoreTranslationOverlay(selection, null)
-            return
-        }
-
-        if (!awaitFrameRequest(request, selection)) {
-            updateIfCurrent(selection) {
-                DebugStore.captureStatus.value = "WAITING FOR CLEAN FRAME"
-            }
-            restoreTranslationOverlay(selection, null)
-            return
-        }
-
-        if (!isCurrentSelection(selection)) return
-        val (bitmapWidth, bitmapHeight) = screenCaptureManager.bitmapSize() ?: run {
-            updateIfCurrent(selection) {
-                DebugStore.captureStatus.value = "WAITING FOR FRAME"
-            }
-            restoreTranslationOverlay(selection, null)
-            return
-        }
-        if (!updateIfCurrent(selection) {
-                DebugStore.captureFrameWidth.value = bitmapWidth
-                DebugStore.captureFrameHeight.value = bitmapHeight
-            }
-        ) return
-        val area = toBitmapRect(selection, bitmapWidth, bitmapHeight)
-
         var nextOverlayRegions: List<OverlayTextRegion>? = null
         try {
+            if (!isCurrentSelection(selection)) return
+            val request = screenCaptureManager.requestFreshFrames(count = 1)
+            if (request == null) {
+                updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "WAITING FOR FRAME"
+                }
+                return
+            }
+
+            val frameWaitTimeoutMs = if (overlayWasHidden) {
+                OVERLAY_HIDDEN_FRAME_WAIT_TIMEOUT_MS
+            } else {
+                FRAME_WAIT_TIMEOUT_MS
+            }
+            if (!awaitFrameRequest(request, selection, frameWaitTimeoutMs)) {
+                updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "WAITING FOR CLEAN FRAME"
+                }
+                return
+            }
+
+            if (!isCurrentSelection(selection)) return
+            val (bitmapWidth, bitmapHeight) = screenCaptureManager.bitmapSize() ?: run {
+                updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "WAITING FOR FRAME"
+                }
+                return
+            }
+            if (!updateIfCurrent(selection) {
+                    DebugStore.captureFrameWidth.value = bitmapWidth
+                    DebugStore.captureFrameHeight.value = bitmapHeight
+                }
+            ) return
+            val area = toBitmapRect(selection, bitmapWidth, bitmapHeight)
+
             if (!updateIfCurrent(selection) {
                     DebugStore.captureStatus.value = "CAPTURING..."
                 }
@@ -452,8 +457,8 @@ class OverlayService : Service() {
                 return
             }
 
-            // The captured bitmap is already an independent snapshot. Restore the
-            // previous result now instead of leaving it hidden during OCR/translation.
+            // Keep the overlay hidden only while obtaining a clean compositor
+            // frame. OCR and translation run with the previous result visible.
             restoreTranslationOverlay(selection, null)
 
             if (!updateIfCurrent(selection) {
@@ -482,7 +487,9 @@ class OverlayService : Service() {
                     DebugStore.detectedBlocks.value = ocr.blockCount
                     DebugStore.detectedLines.value = ocr.lineCount
 
-                    when (ocrStabilityTracker.observe(ocr.regions)) {
+                    val decision = ocrStabilityTracker.observe(ocr.regions)
+                    nextCaptureDelayMs = CaptureCadencePolicy.delayAfter(decision)
+                    when (decision) {
                         OcrUpdateDecision.WAITING_FOR_STABLE_TEXT -> {
                             DebugStore.captureStatus.value = "STABILIZING OCR..."
                         }
@@ -500,14 +507,17 @@ class OverlayService : Service() {
                                 DebugStore.captureStatus.value = "TRANSLATING..."
                             } else {
                                 DebugStore.translationResult.value = "SKIPPED (OCR ONLY)"
-                                nextOverlayRegions = ocr.regions.map { region ->
-                                    OverlayTextRegionMapper.map(
-                                        source = region,
-                                        translatedText = region.text,
-                                        imageWidth = bitmap.width,
-                                        imageHeight = bitmap.height,
-                                    )
-                                }
+                                nextOverlayRegions = positionOverlayRegions(
+                                    regions = ocr.regions.map { region ->
+                                        OverlayTextRegionMapper.map(
+                                            source = region,
+                                            translatedText = region.text,
+                                            imageWidth = bitmap.width,
+                                            imageHeight = bitmap.height,
+                                        )
+                                    },
+                                    selection = selection,
+                                )
                                 DebugStore.captureStatus.value = "OK"
                             }
                         }
@@ -518,7 +528,7 @@ class OverlayService : Service() {
             val stableRegions = regionsToTranslate
             if (stableRegions != null) {
                 val translatedRegions = withTimeoutOrNull(TRANSLATION_TIMEOUT_MS) {
-                    stableRegions.map { region ->
+                    val mappedRegions = stableRegions.map { region ->
                         val translatedText =
                             translateManager.translate(region.text) ?: region.text
                         OverlayTextRegionMapper.map(
@@ -528,9 +538,14 @@ class OverlayService : Service() {
                             imageHeight = bitmap.height,
                         )
                     }
+                    positionOverlayRegions(
+                        regions = mappedRegions,
+                        selection = selection,
+                    )
                 }
                 if (translatedRegions == null) {
                     ocrStabilityTracker.reset()
+                    nextCaptureDelayMs = CaptureCadencePolicy.STABILITY_RECHECK_MS
                     updateIfCurrent(selection) {
                         DebugStore.captureStatus.value = "TRANSLATION TIMEOUT"
                         DebugStore.translationResult.value = "TIMEOUT"
@@ -548,6 +563,7 @@ class OverlayService : Service() {
             throw e
         } catch (e: Exception) {
             ocrStabilityTracker.reset()
+            nextCaptureDelayMs = CaptureCadencePolicy.NORMAL_INTERVAL_MS
             withContext(Dispatchers.Main.immediate) {
                 if (isCurrentSelection(selection)) {
                     DebugStore.captureStatus.value = "ERROR"
@@ -564,9 +580,10 @@ class OverlayService : Service() {
     private suspend fun awaitFrameRequest(
         request: FrameRequest,
         selection: SelectedArea,
+        timeoutMs: Long,
     ): Boolean {
         return try {
-            val reachedTarget = withTimeoutOrNull(FRAME_WAIT_TIMEOUT_MS) {
+            val reachedTarget = withTimeoutOrNull(timeoutMs) {
                 while (screenCaptureManager.frameSequence() < request.target) {
                     if (!isCurrentSelection(selection)) {
                         return@withTimeoutOrNull false
@@ -604,6 +621,24 @@ class OverlayService : Service() {
                 }
             }
         }
+    }
+
+    private fun positionOverlayRegions(
+        regions: List<OverlayTextRegion>,
+        selection: SelectedArea,
+    ): List<OverlayTextRegion> {
+        val density = resources.displayMetrics.density
+        val minimumWidthFraction =
+            (72f * density / selection.width.coerceAtLeast(1))
+                .coerceIn(0.08f, 0.65f)
+        val minimumHeightFraction =
+            (24f * density / selection.height.coerceAtLeast(1))
+                .coerceIn(0.04f, 0.35f)
+        return OverlayPlacementEngine.place(
+            regions = regions,
+            minimumWidthFraction = minimumWidthFraction,
+            minimumHeightFraction = minimumHeightFraction,
+        )
     }
 
     private fun ownsSelection(selection: SelectedArea): Boolean {
@@ -757,6 +792,7 @@ class OverlayService : Service() {
         }
         ocrStabilityTracker.reset()
         translateManager.resetLastText()
+        nextCaptureDelayMs = CaptureCadencePolicy.NORMAL_INTERVAL_MS
         captureAttemptJob?.cancel()
         screenCaptureManager.cancelPendingFrameRequests()
     }

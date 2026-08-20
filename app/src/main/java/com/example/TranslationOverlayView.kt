@@ -37,54 +37,41 @@ internal class TranslationOverlayView(context: Context) : FrameLayout(context) {
         lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
         lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_START)
         lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
-        
+
         setViewTreeLifecycleOwner(lifecycleOwner)
         setViewTreeSavedStateRegistryOwner(lifecycleOwner)
-        
+
         val composeView = ComposeView(context).apply {
             setContent {
                 val regions by regionsState
                 val isVisible by visibleState
-                
+
                 if (isVisible && regions.isNotEmpty()) {
                     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
                         regions.forEach { region ->
-                            val sourceX =
-                                maxWidth * region.leftFraction.coerceIn(0f, 1f)
-                            val sourceY =
-                                maxHeight * region.topFraction.coerceIn(0f, 1f)
-                            val sourceWidth =
-                                maxWidth * region.widthFraction.coerceIn(0f, 1f)
-                            val sourceHeight =
-                                maxHeight * region.heightFraction.coerceIn(0f, 1f)
-                            val minimumHeight = sourceHeight.coerceAtLeast(28.dp)
-                            val x = sourceX.coerceAtMost(
-                                (maxWidth - 1.dp).coerceAtLeast(0.dp),
-                            )
-                            val y = sourceY.coerceAtMost(
-                                (maxHeight - minimumHeight).coerceAtLeast(0.dp),
-                            )
-                            val availableWidth =
-                                (maxWidth - x).coerceAtLeast(1.dp)
-                            val desiredWidth =
-                                (sourceWidth * 1.4f).coerceAtLeast(96.dp)
-                            val boxWidth = desiredWidth.coerceAtMost(availableWidth)
+                            val bounds = region.displayBounds
+                            val x = maxWidth * bounds.left
+                            val y = maxHeight * bounds.top
+                            val boxWidth = maxWidth * bounds.width
+                            val boxHeight = maxHeight * bounds.height
 
                             Box(
                                 modifier = Modifier
                                     .offset(x = x, y = y)
-                                    .width(boxWidth)
-                                    .defaultMinSize(minHeight = minimumHeight)
+                                    .size(
+                                        width = boxWidth,
+                                        height = boxHeight,
+                                    )
                                     .clip(RoundedCornerShape(6.dp))
                                     .background(Color(0xE6000000))
-                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                    .padding(horizontal = 6.dp, vertical = 3.dp),
                             ) {
                                 Text(
                                     text = region.text,
                                     color = Color.White,
-                                    fontSize = 14.sp,
-                                    lineHeight = 17.sp,
-                                    maxLines = 4,
+                                    fontSize = 13.sp,
+                                    lineHeight = 16.sp,
+                                    maxLines = 3,
                                     overflow = TextOverflow.Ellipsis,
                                 )
                             }
@@ -107,15 +94,12 @@ internal class TranslationOverlayView(context: Context) : FrameLayout(context) {
         visibleState.value = visibleRegions.isNotEmpty()
     }
 
-    /**
-     * Hides the translated text before MediaProjection takes the next frame.
-     * Returns true when a newly captured frame is required to avoid OCR feedback.
-     */
     fun hideForCapture(): Boolean {
-        val needsFreshFrame =
-            visibility == View.VISIBLE && regionsState.value.isNotEmpty()
-        if (needsFreshFrame) visibility = View.INVISIBLE
-        return needsFreshFrame
+        val wasVisible = visibility == View.VISIBLE && visibleState.value
+        if (wasVisible) {
+            visibility = View.INVISIBLE
+        }
+        return wasVisible
     }
 
     fun setCaptureHidden(hidden: Boolean) {
