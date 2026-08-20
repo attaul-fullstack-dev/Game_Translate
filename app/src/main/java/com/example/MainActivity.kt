@@ -1,10 +1,11 @@
 package com.example
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
-import android.util.DisplayMetrics
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -13,7 +14,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.BugReport
@@ -32,12 +32,24 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var projectionManager: MediaProjectionManager
     private val translateManager = TranslateManager()
+    private val overlayPermissionState = mutableStateOf(false)
+
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted) {
+                Toast.makeText(
+                    this,
+                    "Notifikasi ditolak; translator tetap dijalankan.",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+            launchScreenCaptureConsent()
+        }
 
     private val screenCaptureLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
@@ -50,6 +62,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        overlayPermissionState.value = PermissionHelper.hasOverlayPermission(this)
 
         setContent {
             MaterialTheme(
@@ -68,29 +81,27 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun MainScreen() {
         val scope = rememberCoroutineScope()
-        var hasOverlayPerm by remember { mutableStateOf(PermissionHelper.hasOverlayPermission(this)) }
+        val hasOverlayPerm by overlayPermissionState
+        val serviceState by DebugStore.serviceState
         var isModelDownloaded by remember { mutableStateOf(false) }
         var isDownloading by remember { mutableStateOf(false) }
+        var modelError by remember { mutableStateOf("") }
         var selectedTab by remember { mutableIntStateOf(0) }
         var testResult by remember { mutableStateOf("") }
         var testError by remember { mutableStateOf("") }
 
         LaunchedEffect(Unit) {
-            while (true) {
-                hasOverlayPerm = PermissionHelper.hasOverlayPermission(this@MainActivity)
+            isDownloading = true
+            try {
                 isModelDownloaded = translateManager.isModelDownloaded()
-                if (!isModelDownloaded && !isDownloading && hasOverlayPerm) {
-                     isDownloading = true
-                     try {
-                         translateManager.downloadModelsIfNeeded()
-                         isModelDownloaded = true
-                     } catch (e: Exception) {
-                         // ignore silently on auto download
-                     } finally {
-                         isDownloading = false
-                     }
+                if (!isModelDownloaded) {
+                    translateManager.downloadModelsIfNeeded()
+                    isModelDownloaded = true
                 }
-                delay(2000)
+            } catch (e: Exception) {
+                modelError = e.localizedMessage ?: "Model terjemahan gagal disiapkan."
+            } finally {
+                isDownloading = false
             }
         }
 
@@ -146,6 +157,7 @@ class MainActivity : ComponentActivity() {
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
                         .padding(24.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
@@ -253,6 +265,15 @@ class MainActivity : ComponentActivity() {
                                     modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
                                 )
                             }
+
+                            if (modelError.isNotBlank()) {
+                                Text(
+                                    text = modelError,
+                                    fontSize = 12.sp,
+                                    color = Color.Red,
+                                    modifier = Modifier.padding(bottom = 12.dp),
+                                )
+                            }
                             
                             HorizontalDivider(color = Color.DarkGray)
                             
@@ -282,20 +303,25 @@ class MainActivity : ComponentActivity() {
 
                     Button(
                         onClick = { startCapture() },
-                        enabled = hasOverlayPerm,
+                        enabled = hasOverlayPerm && isModelDownloaded && serviceState != "RUNNING",
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(56.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                         shape = RoundedCornerShape(28.dp)
                     ) {
-                        Text("Mulai Translate", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                        Text(
+                            if (serviceState == "RUNNING") "Translator Aktif" else "Mulai Translate",
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                        )
                     }
                     
                     Spacer(modifier = Modifier.height(16.dp))
                     
                     Text(
-                        text = "Overlay akan muncul saat game berjalan",
+                        text = "Ketuk bubble untuk jeda/lanjut, tahan untuk memilih ulang area.",
                         fontSize = 12.sp,
                         color = Color.Gray,
                         textAlign = TextAlign.Center
@@ -339,9 +365,58 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }
+                    } else if (selectedTab == 2) {
+                        SettingsPanel(serviceState == "RUNNING")
                     } else if (selectedTab == 3) {
                         DiagnosticPanel()
                     }
+                }
+            }
+        }
+    }
+
+    @Composable
+    fun SettingsPanel(isServiceRunning: Boolean) {
+        val translationEnabled by DebugStore.enableTranslation
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    text = "Pengaturan Translator",
+                    color = Color.White,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Terjemahan", color = Color.White)
+                        Text(
+                            "Matikan untuk menguji hasil OCR mentah.",
+                            color = Color.LightGray,
+                            fontSize = 12.sp,
+                        )
+                    }
+                    Switch(
+                        checked = translationEnabled,
+                        onCheckedChange = { DebugStore.enableTranslation.value = it },
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                OutlinedButton(
+                    onClick = { stopService(Intent(this@MainActivity, OverlayService::class.java)) },
+                    enabled = isServiceRunning,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(if (isServiceRunning) "Hentikan Translator" else "Translator Tidak Aktif")
                 }
             }
         }
@@ -367,9 +442,7 @@ class MainActivity : ComponentActivity() {
         val enableTrans = DebugStore.enableTranslation.value
 
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
+            modifier = Modifier.fillMaxSize()
         ) {
             Text("System Diagnostics", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
             Spacer(modifier = Modifier.height(16.dp))
@@ -516,39 +589,43 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Refresh permission state on resume
-        setContent {
-            MaterialTheme(
-                colorScheme = darkColorScheme(
-                    background = Color(0xFF0F0F1A),
-                    surface = Color(0xFF1E1E2E), // lighter than the old 0x1A1A2E roughly
-                    primary = Color(0xFFA855F7), // purple
-                    onPrimary = Color.White
-                )
-            ) {
-                MainScreen()
-            }
-        }
+        overlayPermissionState.value = PermissionHelper.hasOverlayPermission(this)
+    }
+
+    override fun onDestroy() {
+        translateManager.close()
+        super.onDestroy()
     }
 
     private fun startCapture() {
-        if (!PermissionHelper.hasNotificationPermission(this)) {
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
-            }
+        if (!PermissionHelper.hasOverlayPermission(this)) {
+            PermissionHelper.requestOverlayPermission(this)
+            return
         }
+        if (DebugStore.serviceState.value == "RUNNING") {
+            Toast.makeText(this, "Translator sudah aktif.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !PermissionHelper.hasNotificationPermission(this)
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+
+        launchScreenCaptureConsent()
+    }
+
+    private fun launchScreenCaptureConsent() {
         val intent = projectionManager.createScreenCaptureIntent()
         screenCaptureLauncher.launch(intent)
     }
 
     private fun startOverlayService(resultCode: Int, data: Intent) {
-        val metrics = resources.displayMetrics
         val serviceIntent = Intent(this, OverlayService::class.java).apply {
-            putExtra("RESULT_CODE", resultCode)
-            putExtra("DATA", data)
-            putExtra("WIDTH", metrics.widthPixels)
-            putExtra("HEIGHT", metrics.heightPixels)
-            putExtra("DENSITY", metrics.densityDpi)
+            putExtra(OverlayService.EXTRA_RESULT_CODE, resultCode)
+            putExtra(OverlayService.EXTRA_DATA, data)
         }
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
             startForegroundService(serviceIntent)

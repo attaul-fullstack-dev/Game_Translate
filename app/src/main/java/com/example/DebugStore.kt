@@ -27,6 +27,23 @@ object DebugStore {
 
     var enableTranslation = mutableStateOf(true)
 
+    fun resetSession() {
+        captureStatus.value = "IDLE"
+        bitmapCaptured.value = false
+        lastBitmap.value = null
+        ocrRawText.value = ""
+        ocrTextLength.value = 0
+        translationResult.value = ""
+        ocrOverlayState.value = "IDLE"
+        lastError.value = ""
+        detectedBlocks.value = 0
+        detectedLines.value = 0
+        selectedAreaX.value = 0
+        selectedAreaY.value = 0
+        selectedAreaW.value = 0
+        selectedAreaH.value = 0
+    }
+
     fun logError(e: Throwable) {
         val errorString = Log.getStackTraceString(e)
         Log.e("TranslationAppError", "Error caught: $errorString")

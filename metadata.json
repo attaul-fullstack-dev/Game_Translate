@@ -1,6 +1,6 @@
 {
   "name": "Game Translator",
-  "description": "Real-time game translator using OCR and ML Kit.",
+  "description": "On-device English-to-Indonesian game translator using screen capture, OCR, and an overlay.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": ["SCREEN_CAPTURE", "ON_DEVICE_OCR", "ON_DEVICE_TRANSLATION", "SYSTEM_OVERLAY"]
 }

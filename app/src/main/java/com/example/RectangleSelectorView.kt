@@ -2,6 +2,8 @@ package com.example
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Rect
+import android.os.Build
 import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -36,8 +38,10 @@ class RectangleSelectorView(
     private val onCancel: () -> Unit
 ) : FrameLayout(context) {
 
+    private val lifecycleOwner = MyLifecycleOwner()
     var params: WindowManager.LayoutParams? = null
 
+    private var isTrackingGesture = false
     private var isResizing = false
     private var initialX = 0
     private var initialY = 0
@@ -47,7 +51,6 @@ class RectangleSelectorView(
     private var initialHeight = 0
 
     init {
-        val lifecycleOwner = MyLifecycleOwner()
         lifecycleOwner.performRestore(null)
         lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
         lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_START)
@@ -114,38 +117,84 @@ class RectangleSelectorView(
         }
 
         addView(composeView)
+    }
 
-        setOnTouchListener { _, event ->
-            val layoutParams = params ?: return@setOnTouchListener true
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    initialX = layoutParams.x
-                    initialY = layoutParams.y
-                    initialTouchX = event.rawX
-                    initialTouchY = event.rawY
-                    initialWidth = layoutParams.width
-                    initialHeight = layoutParams.height
-
-                    val cornerSizePixels = 88f
-                    isResizing = event.x >= layoutParams.width - cornerSizePixels &&
-                            event.y >= layoutParams.height - cornerSizePixels
-                    return@setOnTouchListener false
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    if (isResizing) {
-                        val newWidth = initialWidth + (event.rawX - initialTouchX).toInt()
-                        val newHeight = initialHeight + (event.rawY - initialTouchY).toInt()
-                        layoutParams.width = maxOf(200, newWidth)
-                        layoutParams.height = maxOf(100, newHeight)
-                    } else {
-                        layoutParams.x = initialX + (event.rawX - initialTouchX).toInt()
-                        layoutParams.y = initialY + (event.rawY - initialTouchY).toInt()
-                    }
-                    windowManager.updateViewLayout(this, layoutParams)
-                    return@setOnTouchListener true
-                }
+    override fun onInterceptTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                // Let Compose own taps on the confirm/cancel buttons.
+                isTrackingGesture = !isInsideActionButtons(event)
+                return isTrackingGesture
             }
-            false
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> isTrackingGesture = false
+        }
+        return isTrackingGesture
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        val layoutParams = params ?: return false
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                initialX = layoutParams.x
+                initialY = layoutParams.y
+                initialTouchX = event.rawX
+                initialTouchY = event.rawY
+                initialWidth = layoutParams.width
+                initialHeight = layoutParams.height
+
+                val resizeHandle = dpToPx(48).toFloat()
+                isResizing = event.x >= width - resizeHandle && event.y >= height - resizeHandle
+                isTrackingGesture = true
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val bounds = displayBounds()
+                if (isResizing) {
+                    val maximumWidth = (bounds.width() - initialX).coerceAtLeast(dpToPx(200))
+                    val maximumHeight = (bounds.height() - initialY).coerceAtLeast(dpToPx(100))
+                    layoutParams.width = (initialWidth + (event.rawX - initialTouchX).toInt())
+                        .coerceIn(dpToPx(200), maximumWidth)
+                    layoutParams.height = (initialHeight + (event.rawY - initialTouchY).toInt())
+                        .coerceIn(dpToPx(100), maximumHeight)
+                } else {
+                    layoutParams.x = (initialX + (event.rawX - initialTouchX).toInt())
+                        .coerceIn(0, (bounds.width() - layoutParams.width).coerceAtLeast(0))
+                    layoutParams.y = (initialY + (event.rawY - initialTouchY).toInt())
+                        .coerceIn(0, (bounds.height() - layoutParams.height).coerceAtLeast(0))
+                }
+                windowManager.updateViewLayout(this, layoutParams)
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                isTrackingGesture = false
+                return true
+            }
+        }
+        return super.onTouchEvent(event)
+    }
+
+    override fun onDetachedFromWindow() {
+        lifecycleOwner.destroy()
+        super.onDetachedFromWindow()
+    }
+
+    private fun isInsideActionButtons(event: MotionEvent): Boolean {
+        val actionWidth = dpToPx(112)
+        val actionHeight = dpToPx(64)
+        return event.x >= width - actionWidth && event.y <= actionHeight
+    }
+
+    private fun displayBounds(): Rect {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            windowManager.maximumWindowMetrics.bounds
+        } else {
+            @Suppress("DEPRECATION")
+            val metrics = android.util.DisplayMetrics().also {
+                windowManager.defaultDisplay.getRealMetrics(it)
+            }
+            Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
         }
     }
+
+    private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
 }

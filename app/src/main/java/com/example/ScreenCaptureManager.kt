@@ -10,13 +10,17 @@ import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
 
-class ScreenCaptureManager(private val context: Context) {
+class ScreenCaptureManager(
+    private val context: Context,
+    private val onProjectionStopped: () -> Unit = {},
+) {
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
@@ -45,11 +49,28 @@ class ScreenCaptureManager(private val context: Context) {
         override fun onStop() {
             Log.w("ScreenCapture", "MediaProjection stopped by system")
             DebugStore.captureStatus.value = "PROJECTION_STOPPED"
-            latestBitmap = null
+            synchronized(captureLock) {
+                stopped = true
+                releaseFrameResourcesLocked()
+                mediaProjection = null
+            }
+            onProjectionStopped()
+        }
+
+        override fun onCapturedContentResize(width: Int, height: Int) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && width > 0 && height > 0) {
+                try {
+                    resizeVirtualDisplay(width, height, context.resources.displayMetrics.densityDpi)
+                } catch (e: Exception) {
+                    DebugStore.logError(e)
+                }
+            }
         }
     }
 
-    fun start(resultCode: Int, data: Intent, width: Int, height: Int, density: Int) {
+    fun start(resultCode: Int, data: Intent) {
+        check(mediaProjection == null) { "Screen capture session is already active" }
+        stopped = false
         val projectionManager =
             context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = projectionManager.getMediaProjection(resultCode, data)
@@ -57,53 +78,101 @@ class ScreenCaptureManager(private val context: Context) {
         // Register callback BEFORE createVirtualDisplay (required on Android 14+).
         mediaProjection?.registerCallback(projectionCallback, handler)
 
-        createVirtualDisplay()
+        val (width, height, density) = currentDisplayGeometry()
+        resizeVirtualDisplay(width, height, density)
     }
 
     /**
-     * (Re)creates the ImageReader + VirtualDisplay at the current real screen size.
-     * Must be called again after a rotation so the captured frames match the
-     * on-screen orientation (otherwise landscape frames are letterboxed/scaled and
-     * crop coordinates no longer line up — Masalah 2).
+     * Updates the capture surface to the current display size. A MediaProjection
+     * token may create only one VirtualDisplay on Android 14+, so rotations use
+     * VirtualDisplay.resize() + setSurface() instead of creating another display.
      */
     @SuppressLint("WrongConstant")
-    fun createVirtualDisplay() {
+    fun refreshDisplayGeometry() {
         if (stopped) return
-        val projection = mediaProjection ?: return
+        val (width, height, density) = currentDisplayGeometry()
+        try {
+            resizeVirtualDisplay(width, height, density)
+        } catch (e: Exception) {
+            DebugStore.logError(e)
+        }
+    }
 
-        val metrics = DisplayMetrics()
-        (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)
-            .defaultDisplay.getRealMetrics(metrics)
+    private fun currentDisplayGeometry(): Triple<Int, Int, Int> {
+        val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = windowManager.maximumWindowMetrics.bounds
+            Triple(bounds.width(), bounds.height(), context.resources.displayMetrics.densityDpi)
+        } else {
+            @Suppress("DEPRECATION")
+            val metrics = DisplayMetrics().also { windowManager.defaultDisplay.getRealMetrics(it) }
+            Triple(metrics.widthPixels, metrics.heightPixels, metrics.densityDpi)
+        }
+    }
 
-        // No-op if size hasn't actually changed and we already have a display.
+    private fun resizeVirtualDisplay(width: Int, height: Int, density: Int) {
+        if (stopped || width <= 0 || height <= 0) return
         if (virtualDisplay != null &&
-            captureWidth == metrics.widthPixels &&
-            captureHeight == metrics.heightPixels
-        ) {
-            return
-        }
+            captureWidth == width &&
+            captureHeight == height &&
+            densityDpi == density
+        ) return
 
-        captureWidth = metrics.widthPixels
-        captureHeight = metrics.heightPixels
-        densityDpi = metrics.densityDpi
+        val projection = mediaProjection ?: return
+        val newReader = createImageReader(width, height)
 
-        // Release previous resources before recreating. Take the lock so we don't
-        // close the old reader while its callback is mid-copy (SIGSEGV otherwise).
         synchronized(captureLock) {
-            virtualDisplay?.release()
-            imageReader?.close()
-            virtualDisplay = null
-            imageReader = null
-            latestBitmap = null
-        }
+            if (stopped) {
+                newReader.close()
+                return
+            }
 
-        val reader = ImageReader.newInstance(captureWidth, captureHeight, PixelFormat.RGBA_8888, 2)
+            val oldReader = imageReader
+            captureWidth = width
+            captureHeight = height
+            densityDpi = density
+            imageReader = newReader
+            latestBitmap?.recycle()
+            latestBitmap = null
+
+            val display = virtualDisplay
+            if (display == null) {
+                virtualDisplay = projection.createVirtualDisplay(
+                    "ScreenCapture",
+                    captureWidth,
+                    captureHeight,
+                    densityDpi,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    newReader.surface,
+                    null,
+                    handler,
+                ) ?: run {
+                    imageReader = null
+                    newReader.close()
+                    throw IllegalStateException("Unable to create screen capture display")
+                }
+            } else {
+                display.resize(captureWidth, captureHeight, densityDpi)
+                display.setSurface(newReader.surface)
+                oldReader?.close()
+            }
+
+            Log.d("ScreenCapture", "Capture surface ready: ${captureWidth}x${captureHeight}")
+        }
+    }
+
+    private fun createImageReader(width: Int, height: Int): ImageReader {
+        val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         reader.setOnImageAvailableListener({ r ->
             // Hold the lock for the WHOLE callback so teardown (which also takes the
             // lock) cannot free the native buffer mid-copy. Bail early if stopped.
             synchronized(captureLock) {
                 if (stopped) {
                     // Drain so the reader doesn't stall, but don't touch the buffer.
+                    try { r.acquireLatestImage()?.close() } catch (_: Throwable) {}
+                    return@synchronized
+                }
+                if (r !== imageReader) {
                     try { r.acquireLatestImage()?.close() } catch (_: Throwable) {}
                     return@synchronized
                 }
@@ -120,27 +189,19 @@ class ScreenCaptureManager(private val context: Context) {
 
                     // Guard against a buffer/bitmap size mismatch BEFORE the native
                     // copy — a too-small buffer is the other path to a SIGSEGV.
-                    val needed = bmpWidth * captureHeight * pixelStride
+                    val needed = bmpWidth * height * pixelStride
                     if (buffer.remaining() < needed) {
                         Log.w("ScreenCapture", "Buffer too small: have=${buffer.remaining()} need=$needed")
                         return@synchronized
                     }
 
-                    val padded = Bitmap.createBitmap(
-                        bmpWidth,
-                        captureHeight,
-                        Bitmap.Config.ARGB_8888
-                    )
-                    padded.copyPixelsFromBuffer(buffer)
-
-                    // Trim padding so latestBitmap is EXACTLY captureWidth x captureHeight.
-                    latestBitmap = if (padded.width != captureWidth) {
-                        val trimmed = Bitmap.createBitmap(padded, 0, 0, captureWidth, captureHeight)
-                        padded.recycle()
-                        trimmed
-                    } else {
-                        padded
+                    var frame = latestBitmap
+                    if (frame == null || frame.width != bmpWidth || frame.height != height) {
+                        frame?.recycle()
+                        frame = Bitmap.createBitmap(bmpWidth, height, Bitmap.Config.ARGB_8888)
+                        latestBitmap = frame
                     }
+                    frame.copyPixelsFromBuffer(buffer)
                 } catch (e: Throwable) {
                     // Never let the capture thread crash the process.
                     DebugStore.logError(if (e is Exception) e else RuntimeException(e))
@@ -149,47 +210,51 @@ class ScreenCaptureManager(private val context: Context) {
                 }
             }
         }, handler)
-        imageReader = reader
-
-        virtualDisplay = projection.createVirtualDisplay(
-            "ScreenCapture",
-            captureWidth, captureHeight, densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            reader.surface, null, null
-        )
-
-        Log.d("ScreenCapture", "VirtualDisplay created: ${captureWidth}x${captureHeight}")
+        return reader
     }
 
     fun resetBitmap() {
-        latestBitmap = null
+        synchronized(captureLock) {
+            latestBitmap?.recycle()
+            latestBitmap = null
+        }
     }
 
     /** Actual size of the most recent captured frame (landscape for a force-landscape game), or null. */
     fun bitmapSize(): Pair<Int, Int>? {
-        val b = latestBitmap ?: return null
-        return Pair(b.width, b.height)
+        synchronized(captureLock) {
+            if (latestBitmap == null) return null
+            return Pair(captureWidth, captureHeight)
+        }
     }
 
     fun captureRect(x: Int, y: Int, w: Int, h: Int): Bitmap? {
-        val full = latestBitmap ?: return null
+        synchronized(captureLock) {
+            val full = latestBitmap ?: return null
 
-        // Clamp against the ACTUAL bitmap size, not the cached capture dimensions,
-        // so a mid-rotation frame can never produce an out-of-bounds crop.
-        val bmpW = full.width
-        val bmpH = full.height
+            // Ignore row padding in the reusable backing bitmap.
+            val bmpW = captureWidth.coerceAtMost(full.width)
+            val bmpH = captureHeight.coerceAtMost(full.height)
 
-        val safeX = x.coerceIn(0, maxOf(0, bmpW - 1))
-        val safeY = y.coerceIn(0, maxOf(0, bmpH - 1))
-        val safeW = minOf(w, bmpW - safeX)
-        val safeH = minOf(h, bmpH - safeY)
+            val safeX = x.coerceIn(0, maxOf(0, bmpW - 1))
+            val safeY = y.coerceIn(0, maxOf(0, bmpH - 1))
+            val safeW = minOf(w, bmpW - safeX)
+            val safeH = minOf(h, bmpH - safeY)
 
-        if (safeW <= 0 || safeH <= 0) {
-            Log.e("ScreenCapture", "Invalid rect: x=$safeX y=$safeY w=$safeW h=$safeH bmp=${bmpW}x${bmpH}")
-            return null
+            if (safeW <= 0 || safeH <= 0) {
+                Log.e("ScreenCapture", "Invalid rect: x=$safeX y=$safeY w=$safeW h=$safeH bmp=${bmpW}x${bmpH}")
+                return null
+            }
+
+            val cropped = Bitmap.createBitmap(full, safeX, safeY, safeW, safeH)
+            // Bitmap.createBitmap may return the source for a full-frame crop. The
+            // source is reused by the capture callback, so callers need a snapshot.
+            return if (cropped === full) {
+                full.copy(Bitmap.Config.ARGB_8888, false)
+            } else {
+                cropped
+            }
         }
-
-        return Bitmap.createBitmap(full, safeX, safeY, safeW, safeH)
     }
 
     fun stop() {
@@ -197,16 +262,23 @@ class ScreenCaptureManager(private val context: Context) {
         // ensure no copy is in progress before we free native buffers.
         stopped = true
         synchronized(captureLock) {
-            virtualDisplay?.release()
-            imageReader?.close()
             mediaProjection?.unregisterCallback(projectionCallback)
+            releaseFrameResourcesLocked()
             mediaProjection?.stop()
-
-            virtualDisplay = null
-            imageReader = null
             mediaProjection = null
-            latestBitmap = null
         }
+        handler.removeCallbacksAndMessages(null)
         handlerThread.quitSafely()
+    }
+
+    private fun releaseFrameResourcesLocked() {
+        virtualDisplay?.release()
+        imageReader?.close()
+        latestBitmap?.recycle()
+        virtualDisplay = null
+        imageReader = null
+        latestBitmap = null
+        captureWidth = 0
+        captureHeight = 0
     }
 }

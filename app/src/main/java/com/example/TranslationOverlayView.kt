@@ -2,21 +2,12 @@ package com.example
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.PixelFormat
-import android.os.Build
-import android.view.Gravity
-import android.view.View
 import android.widget.FrameLayout
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.Icon
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -35,11 +26,11 @@ import androidx.savedstate.SavedStateRegistryOwner
 @SuppressLint("ViewConstructor")
 class TranslationOverlayView(context: Context) : FrameLayout(context) {
 
-    private var textState = mutableStateOf("")
-    private var visibleState = mutableStateOf(false)
+    private val textState = mutableStateOf("")
+    private val visibleState = mutableStateOf(false)
+    private val lifecycleOwner = MyLifecycleOwner()
 
     init {
-        val lifecycleOwner = MyLifecycleOwner()
         lifecycleOwner.performRestore(null)
         lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
         lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_START)
@@ -77,6 +68,11 @@ class TranslationOverlayView(context: Context) : FrameLayout(context) {
         textState.value = text
         visibleState.value = text.isNotBlank()
     }
+
+    override fun onDetachedFromWindow() {
+        lifecycleOwner.destroy()
+        super.onDetachedFromWindow()
+    }
 }
 
 class MyLifecycleOwner : LifecycleOwner, SavedStateRegistryOwner {
@@ -95,5 +91,11 @@ class MyLifecycleOwner : LifecycleOwner, SavedStateRegistryOwner {
 
     fun performRestore(savedState: android.os.Bundle?) {
         savedStateRegistryController.performRestore(savedState)
+    }
+
+    fun destroy() {
+        if (lifecycleRegistry.currentState != Lifecycle.State.DESTROYED) {
+            lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+        }
     }
 }
