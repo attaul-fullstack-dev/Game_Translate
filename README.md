@@ -2,20 +2,39 @@
 <img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
 </div>
 
-# Run and deploy your AI Studio app
+# Game Translator
 
-This contains everything you need to run your app locally.
+Android app for capturing a selected game-screen area, recognizing English text
+with ML Kit OCR, translating it to Indonesian on-device, and showing the result
+as a system overlay.
 
-View your app in AI Studio: https://ai.studio/apps/dee0ef65-fa4e-43cc-a518-0ff1b5ab4c87
+## Requirements
 
-## Run Locally
+- Android Studio with JDK 17
+- Android SDK 36
+- Android device or emulator running API 26+
+- Internet access for the first ML Kit translation-model download
 
-**Prerequisites:**  [Android Studio](https://developer.android.com/studio)
+No Gemini API key is required. OCR and translation use Google ML Kit.
 
+## Run locally
 
 1. Open Android Studio
 2. Select **Open** and choose the directory containing this project
 3. Allow Android Studio to fix any incompatibilities as it imports the project.
-4. Create a file named `.env` in the project directory and set `GEMINI_API_KEY` in that file to your Gemini API key (see `.env.example` for an example)
-5. Remove this line from the app's `build.gradle.kts` file: `signingConfig = signingConfigs.getByName("debugConfig")`
-6. Run the app on an emulator or physical device
+4. Run the `app` configuration on an emulator or physical device.
+5. Grant overlay, notification, and screen-capture permissions when prompted.
+
+The first launch downloads the English and Indonesian translation models.
+
+## Overlay controls
+
+- Tap the bubble to select an area, pause, or resume translation.
+- Long-press the bubble to select a different OCR area.
+- Stop the translator from the notification or the app's Settings tab.
+
+## Continuous integration
+
+GitHub Actions uses Gradle 9.5.1 with JDK 17 to run unit tests, Android lint,
+and build the debug APK. Successful runs upload the APK as
+`game-translator-debug`.

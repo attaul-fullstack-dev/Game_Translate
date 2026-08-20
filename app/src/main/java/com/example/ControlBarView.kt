@@ -2,12 +2,13 @@ package com.example
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.os.Bundle
+import android.graphics.Rect
+import android.os.Build
 import android.view.MotionEvent
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.FrameLayout
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
@@ -23,12 +24,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleOwner
-import androidx.lifecycle.LifecycleRegistry
 import androidx.lifecycle.setViewTreeLifecycleOwner
-import androidx.savedstate.SavedStateRegistry
-import androidx.savedstate.SavedStateRegistryController
-import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 
 enum class OverlayState {
@@ -39,10 +35,14 @@ enum class OverlayState {
 class ControlBarView(
     context: Context,
     private val windowManager: WindowManager,
-    private val onBubbleTap: () -> Unit
+    private val onBubbleTap: () -> Unit,
+    private val onBubbleLongPress: () -> Unit,
 ) : FrameLayout(context) {
 
-    private var state = mutableStateOf(OverlayState.IDLE)
+    private val state = mutableStateOf(OverlayState.IDLE)
+    private val lifecycleOwner = MyLifecycleOwner()
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+    private val longPressTimeout = ViewConfiguration.getLongPressTimeout()
     var params: WindowManager.LayoutParams? = null
     
     private var initialX = 0
@@ -56,7 +56,6 @@ class ControlBarView(
     }
 
     init {
-        val lifecycleOwner = MyLifecycleOwner()
         lifecycleOwner.performRestore(null)
         lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
         lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_START)
@@ -73,8 +72,7 @@ class ControlBarView(
                     modifier = Modifier
                         .size(48.dp)
                         .clip(CircleShape)
-                        .background(Color.White)
-                        .clickable { onBubbleTap() },
+                        .background(Color.White),
                     contentAlignment = Alignment.Center
                 ) {
                     val icon = when (currentState) {
@@ -98,8 +96,8 @@ class ControlBarView(
             }
         }
         addView(composeView)
-        
-        setOnTouchListener { _, event ->
+
+        composeView.setOnTouchListener { _, event ->
             val layoutParams = params ?: return@setOnTouchListener false
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
@@ -108,28 +106,64 @@ class ControlBarView(
                     initialTouchX = event.rawX
                     initialTouchY = event.rawY
                     isDragging = false
-                    return@setOnTouchListener false 
+                    true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = event.rawX - initialTouchX
                     val dy = event.rawY - initialTouchY
-                    if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+                    if (kotlin.math.abs(dx) > touchSlop || kotlin.math.abs(dy) > touchSlop) {
                         isDragging = true
                     }
                     if (isDragging) {
-                        layoutParams.x = initialX + dx.toInt()
-                        layoutParams.y = initialY + dy.toInt()
+                        val bounds = displayBounds()
+                        val bubbleWidth = width.takeIf { it > 0 } ?: dpToPx(48)
+                        val bubbleHeight = height.takeIf { it > 0 } ?: dpToPx(48)
+                        layoutParams.x = (initialX + dx.toInt())
+                            .coerceIn(0, (bounds.width() - bubbleWidth).coerceAtLeast(0))
+                        layoutParams.y = (initialY + dy.toInt())
+                            .coerceIn(0, (bounds.height() - bubbleHeight).coerceAtLeast(0))
                         windowManager.updateViewLayout(this, layoutParams)
-                        return@setOnTouchListener true
                     }
+                    true
                 }
+                MotionEvent.ACTION_UP -> {
+                    if (!isDragging) {
+                        if (event.eventTime - event.downTime >= longPressTimeout) {
+                            onBubbleLongPress()
+                        } else {
+                            performClick()
+                        }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> true
+                else -> false
             }
-            false
         }
     }
-}
 
-// Reusing MyLifecycleOwner if it isn't defined elsewhere in this file
-// (It's actually defined in TranslationOverlayView, but compiling might complain if we redefine it. 
-//  Since they are in the same package and it wasn't strictly private, let's just make it private here if needed, 
-//  or use the public one from the package. Given it's already in the package, we can just use MyLifecycleOwner() directly without declaring it here).
+    override fun performClick(): Boolean {
+        super.performClick()
+        onBubbleTap()
+        return true
+    }
+
+    override fun onDetachedFromWindow() {
+        lifecycleOwner.destroy()
+        super.onDetachedFromWindow()
+    }
+
+    private fun displayBounds(): Rect {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            windowManager.maximumWindowMetrics.bounds
+        } else {
+            @Suppress("DEPRECATION")
+            val metrics = android.util.DisplayMetrics().also {
+                windowManager.defaultDisplay.getRealMetrics(it)
+            }
+            Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
+        }
+    }
+
+    private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
+}
