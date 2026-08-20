@@ -1,7 +1,3 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
-
 # Game Translator
 
 Android app for capturing a selected game-screen area, recognizing English text
@@ -10,7 +6,7 @@ as a system overlay.
 
 ## Requirements
 
-- Android Studio with JDK 17
+- Android Studio with JDK 21
 - Android SDK 36
 - Android device or emulator running API 26+
 - Internet access for the first ML Kit translation-model download
@@ -35,6 +31,7 @@ The first launch downloads the English and Indonesian translation models.
 
 ## Continuous integration
 
-GitHub Actions uses Gradle 9.5.1 with JDK 17 to run unit tests, Android lint,
-and build the debug APK. Successful runs upload the APK as
-`game-translator-debug`.
+GitHub Actions provisions Gradle 9.5.1 with JDK 21 to run unit tests, Android
+lint, and the debug APK build. The repository intentionally relies on
+`gradle/actions/setup-gradle`, so CI does not require a checked-in Gradle
+wrapper. Successful runs upload the APK as `game-translator-debug`.
