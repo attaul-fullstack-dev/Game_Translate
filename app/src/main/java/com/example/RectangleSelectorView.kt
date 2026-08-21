@@ -16,6 +16,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -26,6 +27,7 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.setViewTreeLifecycleOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
@@ -34,8 +36,10 @@ import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 class RectangleSelectorView(
     context: Context,
     private val windowManager: WindowManager,
+    private val title: String,
     private val onConfirm: (Int, Int, Int, Int) -> Unit,
-    private val onCancel: () -> Unit
+    private val onCancel: () -> Unit,
+    private val onWindowError: (Throwable) -> Unit,
 ) : FrameLayout(context) {
 
     private val lifecycleOwner = MyLifecycleOwner()
@@ -49,6 +53,7 @@ class RectangleSelectorView(
     private var initialTouchY = 0f
     private var initialWidth = 0
     private var initialHeight = 0
+    private var windowUpdateFailed = false
 
     init {
         lifecycleOwner.performRestore(null)
@@ -79,6 +84,18 @@ class RectangleSelectorView(
                             cornerRadius = CornerRadius(16f, 16f)
                         )
                     }
+
+                    Text(
+                        text = title,
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(8.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color(0xE61A1A2E))
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                    )
 
                     // Action buttons top-end
                     Row(
@@ -162,7 +179,7 @@ class RectangleSelectorView(
                     layoutParams.y = (initialY + (event.rawY - initialTouchY).toInt())
                         .coerceIn(0, (bounds.height() - layoutParams.height).coerceAtLeast(0))
                 }
-                windowManager.updateViewLayout(this, layoutParams)
+                updateWindowLayout(layoutParams)
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -178,6 +195,16 @@ class RectangleSelectorView(
         super.onDetachedFromWindow()
     }
 
+    private fun updateWindowLayout(layoutParams: WindowManager.LayoutParams) {
+        if (windowUpdateFailed || !isAttachedToWindow) return
+        try {
+            windowManager.updateViewLayout(this, layoutParams)
+        } catch (failure: RuntimeException) {
+            windowUpdateFailed = true
+            onWindowError(failure)
+        }
+    }
+
     private fun isInsideActionButtons(event: MotionEvent): Boolean {
         val actionWidth = dpToPx(112)
         val actionHeight = dpToPx(64)
@@ -186,7 +213,7 @@ class RectangleSelectorView(
 
     private fun displayBounds(): Rect {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            windowManager.maximumWindowMetrics.bounds
+            windowManager.currentWindowMetrics.bounds
         } else {
             @Suppress("DEPRECATION")
             val metrics = android.util.DisplayMetrics().also {

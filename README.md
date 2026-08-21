@@ -25,7 +25,8 @@ The first launch downloads the English and Indonesian translation models.
 
 ## Overlay controls
 
-- Tap the bubble to select an area, pause, or resume translation.
+- Tap the active bubble to pause translation.
+- Tap the paused bubble to open the area selector again.
 - Long-press the bubble to select a different OCR area.
 - Stop the translator from the notification or the app's Settings tab.
 

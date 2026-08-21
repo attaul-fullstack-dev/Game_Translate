@@ -5,6 +5,9 @@ import android.util.Log
 import androidx.compose.runtime.mutableStateOf
 
 object DebugStore {
+    @Volatile
+    var isActivityVisible = false
+
     var captureStatus = mutableStateOf("IDLE")
     var bitmapCaptured = mutableStateOf(false)
     var lastBitmap = mutableStateOf<Bitmap?>(null)
@@ -24,6 +27,15 @@ object DebugStore {
     var selectedAreaY = mutableStateOf(0)
     var selectedAreaW = mutableStateOf(0)
     var selectedAreaH = mutableStateOf(0)
+    var translationPanelX = mutableStateOf(0)
+    var translationPanelY = mutableStateOf(0)
+    var translationPanelW = mutableStateOf(0)
+    var translationPanelH = mutableStateOf(0)
+    var selectedDisplayWidth = mutableStateOf(0)
+    var selectedDisplayHeight = mutableStateOf(0)
+    var selectedDisplayRotation = mutableStateOf(0)
+    var captureFrameWidth = mutableStateOf(0)
+    var captureFrameHeight = mutableStateOf(0)
 
     var enableTranslation = mutableStateOf(true)
 
@@ -42,11 +54,25 @@ object DebugStore {
         selectedAreaY.value = 0
         selectedAreaW.value = 0
         selectedAreaH.value = 0
+        translationPanelX.value = 0
+        translationPanelY.value = 0
+        translationPanelW.value = 0
+        translationPanelH.value = 0
+        selectedDisplayWidth.value = 0
+        selectedDisplayHeight.value = 0
+        selectedDisplayRotation.value = 0
+        captureFrameWidth.value = 0
+        captureFrameHeight.value = 0
     }
 
     fun logError(e: Throwable) {
         val errorString = Log.getStackTraceString(e)
         Log.e("TranslationAppError", "Error caught: $errorString")
         lastError.value = errorString
+    }
+
+    fun logMessage(message: String) {
+        Log.e("TranslationAppError", message)
+        lastError.value = message
     }
 }

@@ -27,16 +27,13 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.setViewTreeLifecycleOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 
-enum class OverlayState {
-    IDLE, SELECTING, ACTIVE, PAUSED
-}
-
 @SuppressLint("ViewConstructor", "ClickableViewAccessibility")
 class ControlBarView(
     context: Context,
     private val windowManager: WindowManager,
     private val onBubbleTap: () -> Unit,
     private val onBubbleLongPress: () -> Unit,
+    private val onWindowError: (Throwable) -> Unit,
 ) : FrameLayout(context) {
 
     private val state = mutableStateOf(OverlayState.IDLE)
@@ -50,6 +47,7 @@ class ControlBarView(
     private var initialTouchX = 0f
     private var initialTouchY = 0f
     private var isDragging = false
+    private var windowUpdateFailed = false
 
     fun updateState(newState: OverlayState) {
         state.value = newState
@@ -122,7 +120,7 @@ class ControlBarView(
                             .coerceIn(0, (bounds.width() - bubbleWidth).coerceAtLeast(0))
                         layoutParams.y = (initialY + dy.toInt())
                             .coerceIn(0, (bounds.height() - bubbleHeight).coerceAtLeast(0))
-                        windowManager.updateViewLayout(this, layoutParams)
+                        updateWindowLayout(layoutParams)
                     }
                     true
                 }
@@ -153,9 +151,19 @@ class ControlBarView(
         super.onDetachedFromWindow()
     }
 
+    private fun updateWindowLayout(layoutParams: WindowManager.LayoutParams) {
+        if (windowUpdateFailed || !isAttachedToWindow) return
+        try {
+            windowManager.updateViewLayout(this, layoutParams)
+        } catch (failure: RuntimeException) {
+            windowUpdateFailed = true
+            onWindowError(failure)
+        }
+    }
+
     private fun displayBounds(): Rect {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            windowManager.maximumWindowMetrics.bounds
+            windowManager.currentWindowMetrics.bounds
         } else {
             @Suppress("DEPRECATION")
             val metrics = android.util.DisplayMetrics().also {

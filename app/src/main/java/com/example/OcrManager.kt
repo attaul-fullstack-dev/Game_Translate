@@ -1,29 +1,73 @@
 package com.example
 
 import android.graphics.Bitmap
+import android.graphics.Rect
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.tasks.await
 
-class OcrManager {
+internal class OcrManager {
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
-    suspend fun extractText(bitmap: Bitmap): String {
+    suspend fun extractText(bitmap: Bitmap): OcrSnapshot {
         val image = InputImage.fromBitmap(bitmap, 0)
-        return try {
-            val result = recognizer.process(image).await()
-            DebugStore.detectedBlocks.value = result.textBlocks.size
-            var lines = 0
-            for (block in result.textBlocks) {
-                lines += block.lines.size
+        val result = recognizer.process(image).await()
+        var lines = 0
+        for (block in result.textBlocks) {
+            lines += block.lines.size
+        }
+        val rawRegions = result.textBlocks.flatMap { block ->
+            block.lines.mapNotNull { line ->
+                val text = line.text.trim()
+                if (text.isEmpty()) return@mapNotNull null
+
+                val boundingBox = line.boundingBox ?: unionOf(
+                    line.elements.mapNotNull { it.boundingBox },
+                ) ?: return@mapNotNull null
+                OcrTextRegion(
+                    text = text,
+                    bounds = OcrBounds(
+                        left = boundingBox.left,
+                        top = boundingBox.top,
+                        right = boundingBox.right,
+                        bottom = boundingBox.bottom,
+                    ),
+                )
             }
-            DebugStore.detectedLines.value = lines
-            
-            result.text
-        } catch (e: Exception) {
-            DebugStore.logError(e)
-            throw e
+        }.sortedWith(
+            compareBy<OcrTextRegion> { it.bounds.top }
+                .thenBy { it.bounds.left },
+        )
+        val positionedRegions = if (rawRegions.isNotEmpty() || result.text.isBlank()) {
+            rawRegions
+        } else {
+            listOf(
+                OcrTextRegion(
+                    text = result.text.trim(),
+                    bounds = OcrBounds(
+                        left = 0,
+                        top = 0,
+                        right = bitmap.width,
+                        bottom = bitmap.height,
+                    ),
+                ),
+            )
+        }
+        return OcrSnapshot(
+            text = positionedRegions.joinToString(separator = "\n") { it.text },
+            blockCount = result.textBlocks.size,
+            lineCount = lines,
+            regions = positionedRegions,
+        )
+    }
+
+    private fun unionOf(rectangles: List<Rect>): Rect? {
+        val first = rectangles.firstOrNull() ?: return null
+        return Rect(first).also { union ->
+            rectangles.drop(1).forEach { rectangle ->
+                union.union(rectangle)
+            }
         }
     }
 

@@ -4,8 +4,11 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -31,7 +34,49 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+
+private data class ModelDownloadNetworkStatus(
+    val hasInternet: Boolean,
+    val label: String,
+    val isMetered: Boolean,
+)
+
+private fun currentModelDownloadNetworkStatus(context: Context): ModelDownloadNetworkStatus {
+    val connectivityManager =
+        context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    val network = connectivityManager.activeNetwork
+        ?: return ModelDownloadNetworkStatus(
+            hasInternet = false,
+            label = "Offline",
+            isMetered = false,
+        )
+    val capabilities = connectivityManager.getNetworkCapabilities(network)
+        ?: return ModelDownloadNetworkStatus(
+            hasInternet = false,
+            label = "Offline",
+            isMetered = false,
+        )
+    val transport = when {
+        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
+        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "Data seluler"
+        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet"
+        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
+        else -> "Jaringan aktif"
+    }
+    val hasInternet =
+        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+
+    return ModelDownloadNetworkStatus(
+        hasInternet = hasInternet,
+        label = if (hasInternet) transport else "$transport tanpa internet",
+        isMetered = connectivityManager.isActiveNetworkMetered,
+    )
+}
 
 class MainActivity : ComponentActivity() {
 
@@ -83,25 +128,64 @@ class MainActivity : ComponentActivity() {
         val scope = rememberCoroutineScope()
         val hasOverlayPerm by overlayPermissionState
         val serviceState by DebugStore.serviceState
-        var isModelDownloaded by remember { mutableStateOf(false) }
+        var modelProgress by remember { mutableStateOf(ModelDownloadProgress()) }
         var isDownloading by remember { mutableStateOf(false) }
         var modelError by remember { mutableStateOf("") }
+        var downloadRequest by remember { mutableIntStateOf(0) }
+        var downloadStartedAt by remember { mutableLongStateOf(0L) }
+        var downloadElapsedSeconds by remember { mutableLongStateOf(0L) }
+        var networkStatus by remember {
+            mutableStateOf(currentModelDownloadNetworkStatus(this@MainActivity))
+        }
         var selectedTab by remember { mutableIntStateOf(0) }
         var testResult by remember { mutableStateOf("") }
         var testError by remember { mutableStateOf("") }
+        val modelsReady = modelProgress.allReady
 
         LaunchedEffect(Unit) {
+            while (isActive) {
+                networkStatus = currentModelDownloadNetworkStatus(this@MainActivity)
+                delay(if (isDownloading) 1_000L else 5_000L)
+            }
+        }
+
+        LaunchedEffect(downloadRequest) {
+            modelError = ""
+            downloadElapsedSeconds = 0L
+            downloadStartedAt = SystemClock.elapsedRealtime()
             isDownloading = true
             try {
-                isModelDownloaded = translateManager.isModelDownloaded()
-                if (!isModelDownloaded) {
-                    translateManager.downloadModelsIfNeeded()
-                    isModelDownloaded = true
+                translateManager.prepareModels { progress ->
+                    modelProgress = progress
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                modelError = e.localizedMessage ?: "Model terjemahan gagal disiapkan."
+                val latestNetworkStatus =
+                    currentModelDownloadNetworkStatus(this@MainActivity)
+                networkStatus = latestNetworkStatus
+                modelProgress = modelProgress.copy(phase = ModelDownloadPhase.FAILED)
+                modelError = if (!latestNetworkStatus.hasInternet) {
+                    "Tidak ada koneksi internet. Sambungkan perangkat lalu coba lagi."
+                } else {
+                    e.localizedMessage
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "Model terjemahan gagal disiapkan."
+                }
             } finally {
+                downloadElapsedSeconds =
+                    ((SystemClock.elapsedRealtime() - downloadStartedAt) / 1_000L)
+                        .coerceAtLeast(0L)
                 isDownloading = false
+            }
+        }
+
+        LaunchedEffect(isDownloading, downloadStartedAt) {
+            while (isActive && isDownloading) {
+                downloadElapsedSeconds =
+                    ((SystemClock.elapsedRealtime() - downloadStartedAt) / 1_000L)
+                        .coerceAtLeast(0L)
+                delay(1_000L)
             }
         }
 
@@ -215,95 +299,20 @@ class MainActivity : ComponentActivity() {
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // Model Terjemahan Detailed Status
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(text = "Status Model", fontSize = 14.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
-                                Spacer(modifier = Modifier.weight(1f))
-                                if (isDownloading) {
-                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), color = MaterialTheme.colorScheme.primary, strokeWidth = 2.dp)
-                                } else if (!isModelDownloaded) {
-                                    Button(
-                                        onClick = {
-                                            scope.launch {
-                                                isDownloading = true
-                                                try {
-                                                    translateManager.downloadModelsIfNeeded()
-                                                    isModelDownloaded = true
-                                                } catch (e: Exception) {
-                                                    Toast.makeText(this@MainActivity, "Download gagal", Toast.LENGTH_SHORT).show()
-                                                } finally {
-                                                    isDownloading = false
-                                                }
-                                            }
-                                        },
-                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                                        modifier = Modifier.height(32.dp)
-                                    ) {
-                                        Text("Download", fontSize = 12.sp)
-                                    }
-                                }
-                            }
-                            
-                            if (isModelDownloaded) {
-                                Text(
-                                    text = "Semua model sudah terdownload. Akurasi terjemahan optimal.",
-                                    fontSize = 12.sp,
-                                    color = Color.LightGray,
-                                    modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
-                                )
-                            } else {
-                                Text(
-                                    text = "Model bahasa diperlukan untuk menerjemahkan.",
-                                    fontSize = 12.sp,
-                                    color = Color.LightGray,
-                                    modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
-                                )
-                            }
-
-                            if (modelError.isNotBlank()) {
-                                Text(
-                                    text = modelError,
-                                    fontSize = 12.sp,
-                                    color = Color.Red,
-                                    modifier = Modifier.padding(bottom = 12.dp),
-                                )
-                            }
-                            
-                            HorizontalDivider(color = Color.DarkGray)
-                            
-                            Spacer(modifier = Modifier.height(12.dp))
-                            
-                            // Model Item: Inggris
-                            ModelItem(
-                                name = "Inggris",
-                                desc = "Model Bahasa Inggris",
-                                size = "~31 MB",
-                                isReady = isModelDownloaded
-                            )
-                            
-                            Spacer(modifier = Modifier.height(12.dp))
-                            
-                            // Model Item: Indonesia
-                            ModelItem(
-                                name = "Indonesia",
-                                desc = "Model Bahasa Indonesia",
-                                size = "~31 MB",
-                                isReady = isModelDownloaded
-                            )
-                        }
-                    }
+                    ModelDownloadCard(
+                        progress = modelProgress,
+                        isDownloading = isDownloading,
+                        elapsedSeconds = downloadElapsedSeconds,
+                        networkStatus = networkStatus,
+                        error = modelError,
+                        onRetry = { downloadRequest++ },
+                    )
 
                     Spacer(modifier = Modifier.height(32.dp))
 
                     Button(
                         onClick = { startCapture() },
-                        enabled = hasOverlayPerm && isModelDownloaded && serviceState != "RUNNING",
+                        enabled = hasOverlayPerm && modelsReady && serviceState != "RUNNING",
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(56.dp),
@@ -321,7 +330,7 @@ class MainActivity : ComponentActivity() {
                     Spacer(modifier = Modifier.height(16.dp))
                     
                     Text(
-                        text = "Ketuk bubble untuk jeda/lanjut, tahan untuk memilih ulang area.",
+                        text = "Ketuk bubble aktif untuk jeda, lalu ketuk lagi untuk memilih ulang area.",
                         fontSize = 12.sp,
                         color = Color.Gray,
                         textAlign = TextAlign.Center
@@ -341,14 +350,17 @@ class MainActivity : ComponentActivity() {
                                             try {
                                                 translateManager.resetLastText()
                                                 val res = translateManager.translate("Hello")
-                                                testResult = res ?: "Tidak ada hasil (atau teks sama)"
+                                                testResult = res ?: "Tidak ada hasil"
                                                 testError = ""
+                                            } catch (e: CancellationException) {
+                                                throw e
                                             } catch (e: Exception) {
                                                 testResult = ""
                                                 testError = e.localizedMessage ?: "Unknown Error"
                                             }
                                         }
                                     },
+                                    enabled = modelsReady && !isDownloading,
                                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                                     shape = RoundedCornerShape(8.dp)
                                 ) {
@@ -439,6 +451,15 @@ class MainActivity : ComponentActivity() {
         val selY by DebugStore.selectedAreaY
         val selW by DebugStore.selectedAreaW
         val selH by DebugStore.selectedAreaH
+        val panelX by DebugStore.translationPanelX
+        val panelY by DebugStore.translationPanelY
+        val panelW by DebugStore.translationPanelW
+        val panelH by DebugStore.translationPanelH
+        val selectedDisplayWidth by DebugStore.selectedDisplayWidth
+        val selectedDisplayHeight by DebugStore.selectedDisplayHeight
+        val selectedDisplayRotation by DebugStore.selectedDisplayRotation
+        val captureFrameWidth by DebugStore.captureFrameWidth
+        val captureFrameHeight by DebugStore.captureFrameHeight
         val enableTrans = DebugStore.enableTranslation.value
 
         Column(
@@ -466,7 +487,16 @@ class MainActivity : ComponentActivity() {
             DiagnosticCard("Translation Result", if (translationResult.isNotBlank()) translationResult else "NO_RESULT")
             
             Spacer(modifier = Modifier.height(8.dp))
-            DiagnosticCard("Selected Area", "X:$selX Y:$selY W:$selW H:$selH")
+            DiagnosticCard("OCR Input Area", "X:$selX Y:$selY W:$selW H:$selH")
+            DiagnosticCard(
+                "Translation Panel",
+                "X:$panelX Y:$panelY W:$panelW H:$panelH",
+            )
+            DiagnosticCard(
+                "Selection Space",
+                "${selectedDisplayWidth}x$selectedDisplayHeight @ ${selectedDisplayRotation}°",
+            )
+            DiagnosticCard("Capture Frame", "${captureFrameWidth}x$captureFrameHeight")
 
             if (lastError.isNotBlank()) {
                 Spacer(modifier = Modifier.height(8.dp))
@@ -540,21 +570,252 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    fun ModelItem(name: String, desc: String, size: String, isReady: Boolean) {
+    private fun ModelDownloadCard(
+        progress: ModelDownloadProgress,
+        isDownloading: Boolean,
+        elapsedSeconds: Long,
+        networkStatus: ModelDownloadNetworkStatus,
+        error: String,
+        onRetry: () -> Unit,
+    ) {
+        val isSlow =
+            isDownloading && elapsedSeconds >= SLOW_MODEL_DOWNLOAD_SECONDS
+        val phaseText = when (progress.phase) {
+            ModelDownloadPhase.IDLE -> "Menunggu pemeriksaan model"
+            ModelDownloadPhase.CHECKING -> progress.currentModel?.let {
+                "Memeriksa model ${it.displayName}…"
+            } ?: "Memeriksa model yang tersimpan…"
+            ModelDownloadPhase.DOWNLOADING -> progress.currentModel?.let {
+                "Mengunduh model ${it.displayName}…"
+            } ?: "Mengunduh model terjemahan…"
+            ModelDownloadPhase.VERIFYING -> progress.currentModel?.let {
+                "Memverifikasi model ${it.displayName}…"
+            } ?: "Memverifikasi semua model…"
+            ModelDownloadPhase.READY -> "Semua model siap digunakan"
+            ModelDownloadPhase.FAILED -> "Persiapan model gagal"
+        }
+
+        Card(
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surface,
+            ),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Status Model",
+                        fontSize = 14.sp,
+                        color = Color.White,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    Text(
+                        text = "${progress.completedCount}/${progress.totalCount} siap",
+                        fontSize = 12.sp,
+                        color = if (progress.allReady) Color.Green else Color.LightGray,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = phaseText,
+                    fontSize = 13.sp,
+                    color = if (progress.phase == ModelDownloadPhase.FAILED) {
+                        Color(0xFFFF6B6B)
+                    } else {
+                        Color.White
+                    },
+                )
+
+                if (isDownloading) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Heartbeat ${formatElapsedTime(elapsedSeconds)} • ${networkStatus.label}",
+                        color = if (networkStatus.hasInternet) {
+                            Color(0xFF81C784)
+                        } else {
+                            Color(0xFFFFB74D)
+                        },
+                        fontSize = 12.sp,
+                    )
+                    if (networkStatus.isMetered) {
+                        Text(
+                            text = "Jaringan ini dapat memakai kuota data.",
+                            color = Color.LightGray,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(top = 3.dp),
+                        )
+                    }
+                    Text(
+                        text = "ML Kit tidak menyediakan progres byte/persen; " +
+                            "tahap dan waktu di atas diperbarui secara langsung.",
+                        color = Color.Gray,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(top = 5.dp),
+                    )
+                } else if (progress.allReady) {
+                    Text(
+                        text = "Selesai dalam ${formatElapsedTime(elapsedSeconds)}.",
+                        color = Color.LightGray,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 5.dp),
+                    )
+                }
+
+                if (isDownloading && !networkStatus.hasInternet) {
+                    Text(
+                        text = "Tidak ada akses internet tervalidasi. Download sedang menunggu jaringan.",
+                        color = Color(0xFFFFB74D),
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 10.dp),
+                    )
+                }
+
+                if (isSlow) {
+                    Text(
+                        text = "Download lebih dari 3 menit. Tugas masih aktif; " +
+                            "gunakan Periksa Ulang untuk membaca status model lagi.",
+                        color = Color(0xFFFFB74D),
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 10.dp),
+                    )
+                }
+
+                if (error.isNotBlank()) {
+                    Text(
+                        text = error,
+                        fontSize = 12.sp,
+                        color = Color(0xFFFF6B6B),
+                        modifier = Modifier.padding(top = 10.dp),
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                HorizontalDivider(color = Color.DarkGray)
+                Spacer(modifier = Modifier.height(12.dp))
+
+                TranslationModel.entries.forEachIndexed { index, model ->
+                    ModelItem(
+                        model = model,
+                        progress = progress,
+                        networkStatus = networkStatus,
+                    )
+                    if (index != TranslationModel.entries.lastIndex) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                    }
+                }
+
+                val showRetry = !progress.allReady &&
+                    (!isDownloading || isSlow || !networkStatus.hasInternet)
+                if (showRetry) {
+                    Spacer(modifier = Modifier.height(14.dp))
+                    OutlinedButton(
+                        onClick = onRetry,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            if (isDownloading) "Periksa Ulang" else "Coba Lagi",
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun ModelItem(
+        model: TranslationModel,
+        progress: ModelDownloadProgress,
+        networkStatus: ModelDownloadNetworkStatus,
+    ) {
+        val isReady = model in progress.readyModels
+        val isCurrent = progress.currentModel == model
+        val isBusy = isCurrent &&
+            progress.phase in setOf(
+                ModelDownloadPhase.CHECKING,
+                ModelDownloadPhase.DOWNLOADING,
+                ModelDownloadPhase.VERIFYING,
+            ) &&
+            (progress.phase != ModelDownloadPhase.DOWNLOADING || networkStatus.hasInternet)
+        val statusText = when {
+            isReady -> "Siap"
+            isCurrent &&
+                progress.phase == ModelDownloadPhase.DOWNLOADING &&
+                !networkStatus.hasInternet -> "Menunggu jaringan"
+            isCurrent && progress.phase == ModelDownloadPhase.CHECKING -> "Memeriksa"
+            isCurrent && progress.phase == ModelDownloadPhase.DOWNLOADING -> "Sedang diunduh"
+            isCurrent && progress.phase == ModelDownloadPhase.VERIFYING -> "Memverifikasi"
+            isCurrent && progress.phase == ModelDownloadPhase.FAILED -> "Gagal"
+            progress.phase == ModelDownloadPhase.FAILED -> "Belum siap"
+            else -> "Menunggu"
+        }
+        val statusColor = when {
+            isReady -> Color.Green
+            isCurrent &&
+                progress.phase == ModelDownloadPhase.DOWNLOADING &&
+                !networkStatus.hasInternet -> Color(0xFFFFB74D)
+            progress.phase == ModelDownloadPhase.FAILED -> Color(0xFFFF6B6B)
+            isCurrent -> MaterialTheme.colorScheme.primary
+            else -> Color.Gray
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text(text = name, fontSize = 14.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
-                Text(text = desc, fontSize = 12.sp, color = Color.LightGray)
+                Text(
+                    text = model.displayName,
+                    fontSize = 14.sp,
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = model.description,
+                    fontSize = 12.sp,
+                    color = Color.LightGray,
+                )
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
-                    Box(modifier = Modifier.size(8.dp).background(if(isReady) Color.Green else Color.Red, shape = RoundedCornerShape(4.dp)))
+                    if (isBusy) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(10.dp),
+                            color = statusColor,
+                            strokeWidth = 1.5.dp,
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .background(
+                                    statusColor,
+                                    shape = RoundedCornerShape(4.dp),
+                                ),
+                        )
+                    }
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text(text = if(isReady) "Terdownload" else "Belum", fontSize = 12.sp, color = if(isReady) Color.Green else Color.Red)
+                    Text(
+                        text = statusText,
+                        fontSize = 12.sp,
+                        color = statusColor,
+                    )
                 }
             }
-            Text(text = size, fontSize = 14.sp, color = Color.LightGray)
+            Text(
+                text = model.sizeLabel,
+                fontSize = 14.sp,
+                color = Color.LightGray,
+            )
         }
     }
 
@@ -592,7 +853,18 @@ class MainActivity : ComponentActivity() {
         overlayPermissionState.value = PermissionHelper.hasOverlayPermission(this)
     }
 
+    override fun onStart() {
+        DebugStore.isActivityVisible = true
+        super.onStart()
+    }
+
+    override fun onStop() {
+        DebugStore.isActivityVisible = false
+        super.onStop()
+    }
+
     override fun onDestroy() {
+        DebugStore.isActivityVisible = false
         translateManager.close()
         super.onDestroy()
     }
@@ -627,14 +899,23 @@ class MainActivity : ComponentActivity() {
             putExtra(OverlayService.EXTRA_RESULT_CODE, resultCode)
             putExtra(OverlayService.EXTRA_DATA, data)
         }
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+            // Keep the capture grant's Activity task alive, but put the game back
+            // in front so MediaProjection does not immediately OCR this app.
+            moveTaskToBack(true)
+        } catch (failure: RuntimeException) {
+            DebugStore.logError(failure)
+            Toast.makeText(
+                this,
+                "Translator gagal dijalankan: " +
+                    (failure.localizedMessage ?: "layanan diblokir sistem"),
+                Toast.LENGTH_LONG,
+            ).show()
         }
-        // Move to background instead of finish() so the activity (and its
-        // MediaProjection result) is not torn down — finishing here can cause the
-        // projection to capture our own (now closing) task instead of the game.
-        moveTaskToBack(true)
     }
 }

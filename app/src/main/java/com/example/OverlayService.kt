@@ -13,8 +13,10 @@ import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
 import android.view.Gravity
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.IntentCompat
 import kotlinx.coroutines.*
@@ -26,11 +28,34 @@ class OverlayService : Service() {
         const val EXTRA_RESULT_CODE = "RESULT_CODE"
         const val EXTRA_DATA = "DATA"
 
-        // Direction of the portrait→landscape mapping. Default CCW matches the
-        // on-device measurement. Flip to true if capture/overlay land 180°-off
-        // or mirrored on the target device.
-        private const val CLOCKWISE = false
+        private const val TOUCH_THROUGH_ALPHA = 0.79f
+        private const val FRAME_WAIT_TIMEOUT_MS = 1_250L
+        private const val OCR_TIMEOUT_MS = 5_000L
+        private const val TRANSLATION_TIMEOUT_MS = 8_000L
+        private const val APP_SWITCH_SETTLE_MS = 500L
     }
+
+    private data class SelectedArea(
+        val area: ScreenArea,
+        val displayWidth: Int,
+        val displayHeight: Int,
+        val displayRotation: Int,
+        val epoch: Long,
+    ) {
+        val x: Int get() = area.x
+        val y: Int get() = area.y
+        val width: Int get() = area.width
+        val height: Int get() = area.height
+
+        fun asRect(): IntArray = intArrayOf(x, y, width, height)
+    }
+
+    private data class PendingOcrSelection(
+        val area: ScreenArea,
+        val displayWidth: Int,
+        val displayHeight: Int,
+        val displayRotation: Int,
+    )
 
     private lateinit var windowManager: WindowManager
     private lateinit var screenCaptureManager: ScreenCaptureManager
@@ -39,21 +64,23 @@ class OverlayService : Service() {
 
     private var rectangleSelectorView: RectangleSelectorView? = null
     private var translationOverlayView: TranslationOverlayView? = null
-    private var translationOverlayParams: WindowManager.LayoutParams? = null
     private var controlBarView: ControlBarView? = null
 
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
+    private val captureEpoch = CaptureEpoch()
+    private val ocrStabilityTracker = OcrStabilityTracker()
+    @Volatile
+    private var nextCaptureDelayMs = CaptureCadencePolicy.NORMAL_INTERVAL_MS
     private var captureJob: Job? = null
+    @Volatile
+    private var captureAttemptJob: Job? = null
 
     @Volatile
     private var currentState = OverlayState.IDLE
-    // selectedArea is stored in PORTRAIT window space (the selector/overlay live in
-    // the system's portrait orientation). The game is force-landscape, so the
-    // MediaProjection bitmap is in LANDSCAPE space. captureRect needs the rect
-    // mapped portrait→landscape; the overlay keeps the original portrait coords.
     @Volatile
-    private var selectedArea: IntArray? = null
-    private var consecutiveBlankFrames = 0
+    private var selectedArea: SelectedArea? = null
+    private var translationPanelArea: ScreenArea? = null
+    private var activityWasVisible = false
 
     override fun onCreate() {
         super.onCreate()
@@ -74,13 +101,24 @@ class OverlayService : Service() {
             return START_NOT_STICKY
         }
 
-        DebugStore.serviceState.value = "RUNNING"
-        val notification = createNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(1, notification)
+        try {
+            val notification = createNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    1,
+                    notification,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
+                )
+            } else {
+                startForeground(1, notification)
+            }
+        } catch (failure: RuntimeException) {
+            DebugStore.serviceState.value = "STOPPED"
+            DebugStore.logError(failure)
+            stopSelf()
+            return START_NOT_STICKY
         }
+        DebugStore.serviceState.value = "RUNNING"
 
         if (!PermissionHelper.hasOverlayPermission(this)) {
             DebugStore.lastError.value = "Izin overlay tidak tersedia."
@@ -102,6 +140,7 @@ class OverlayService : Service() {
             screenCaptureManager.start(resultCode, data)
             setupControlBar()
             updateState(OverlayState.IDLE)
+            startCaptureLoop()
         } catch (e: Exception) {
             DebugStore.logError(e)
             stopSelf()
@@ -125,6 +164,7 @@ class OverlayService : Service() {
             windowManager = windowManager,
             onBubbleTap = ::handleBubbleTap,
             onBubbleLongPress = ::reselectArea,
+            onWindowError = ::handleOverlayWindowError,
         )
         val bounds = displayBounds()
         val bubbleMargin = dpToPx(16)
@@ -145,62 +185,166 @@ class OverlayService : Service() {
     }
 
     private fun handleBubbleTap() {
-        when (currentState) {
-            OverlayState.IDLE -> startSelectionMode()
-            OverlayState.ACTIVE -> {
+        when (OverlayInteractionPolicy.actionFor(currentState)) {
+            BubbleTapAction.START_SELECTION -> startSelectionMode()
+            BubbleTapAction.PAUSE -> {
+                invalidateCaptureWork()
+                removeTranslationOverlay()
                 updateState(OverlayState.PAUSED)
-                translationOverlayView?.setText("")
             }
-            OverlayState.PAUSED -> {
-                updateState(OverlayState.ACTIVE)
-            }
-            OverlayState.SELECTING -> cancelSelectionMode()
+            BubbleTapAction.CANCEL_SELECTION -> cancelSelectionMode()
         }
     }
 
     private fun startSelectionMode() {
+        invalidateCaptureWork()
+        rectangleSelectorView?.let(::removeViewSafely)
+        rectangleSelectorView = null
+        removeTranslationOverlay()
         updateState(OverlayState.SELECTING)
 
+        val bounds = displayBounds()
+        val margin = dpToPx(24)
+        val availableWidth = (bounds.width() - margin * 2).coerceAtLeast(1)
+        val availableHeight = (bounds.height() - margin * 2).coerceAtLeast(1)
+        val minimumWidth = dpToPx(200).coerceAtMost(availableWidth)
+        val minimumHeight = dpToPx(100).coerceAtMost(availableHeight)
+        val selectorWidth = (bounds.width() * 0.75f).toInt()
+            .coerceIn(minimumWidth, availableWidth)
+        val selectorHeight = (bounds.height() * 0.28f).toInt()
+            .coerceIn(minimumHeight, availableHeight)
+        val initialArea = ScreenArea(
+            x = ((bounds.width() - selectorWidth) / 2).coerceAtLeast(0),
+            y = ((bounds.height() - selectorHeight) / 2).coerceAtLeast(0),
+            width = selectorWidth,
+            height = selectorHeight,
+        )
+        showAreaSelector(
+            title = "1/2  Pilih area teks game (OCR)",
+            initialArea = initialArea,
+            onConfirm = ::confirmOcrArea,
+        )
+    }
+
+    private fun confirmOcrArea(area: ScreenArea) {
+        val bounds = displayBounds()
+        val pending = PendingOcrSelection(
+            area = area,
+            displayWidth = bounds.width(),
+            displayHeight = bounds.height(),
+            displayRotation = displayRotation(),
+        )
+        val panelArea = ScreenAreaSelectionPolicy.defaultTranslationPanel(
+            ocrArea = area,
+            displayWidth = bounds.width(),
+            displayHeight = bounds.height(),
+            minimumWidth = dpToPx(240),
+            minimumHeight = dpToPx(96),
+            margin = dpToPx(16),
+        )
+        showAreaSelector(
+            title = "2/2  Pilih panel hasil terjemahan",
+            initialArea = panelArea,
+            onConfirm = { confirmedPanel ->
+                completeAreaSelection(pending, confirmedPanel)
+            },
+        )
+    }
+
+    private fun completeAreaSelection(
+        pending: PendingOcrSelection,
+        panelArea: ScreenArea,
+    ) {
+        val bounds = displayBounds()
+        val rotation = displayRotation()
+        if (bounds.width() != pending.displayWidth ||
+            bounds.height() != pending.displayHeight ||
+            rotation != pending.displayRotation
+        ) {
+            Toast.makeText(
+                this,
+                "Orientasi berubah. Pilih ulang kedua area.",
+                Toast.LENGTH_LONG,
+            ).show()
+            startSelectionMode()
+            return
+        }
+        if (!ScreenAreaSelectionPolicy.isInsideDisplay(
+                area = panelArea,
+                displayWidth = bounds.width(),
+                displayHeight = bounds.height(),
+            ) || ScreenAreaSelectionPolicy.overlaps(pending.area, panelArea)
+        ) {
+            Toast.makeText(
+                this,
+                "Panel terjemahan tidak boleh menutupi area OCR.",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+
+        val epoch = captureEpoch.next()
+        val area = SelectedArea(
+            area = pending.area,
+            displayWidth = pending.displayWidth,
+            displayHeight = pending.displayHeight,
+            displayRotation = pending.displayRotation,
+            epoch = epoch,
+        )
+        selectedArea = area
+        translationPanelArea = panelArea
+        ocrStabilityTracker.reset()
+        translateManager.resetLastText()
+        nextCaptureDelayMs = CaptureCadencePolicy.NORMAL_INTERVAL_MS
+
+        DebugStore.selectedAreaX.value = area.x
+        DebugStore.selectedAreaY.value = area.y
+        DebugStore.selectedAreaW.value = area.width
+        DebugStore.selectedAreaH.value = area.height
+        DebugStore.translationPanelX.value = panelArea.x
+        DebugStore.translationPanelY.value = panelArea.y
+        DebugStore.translationPanelW.value = panelArea.width
+        DebugStore.translationPanelH.value = panelArea.height
+        DebugStore.selectedDisplayWidth.value = pending.displayWidth
+        DebugStore.selectedDisplayHeight.value = pending.displayHeight
+        DebugStore.selectedDisplayRotation.value = rotationDegrees(pending.displayRotation)
+
+        rectangleSelectorView?.let(::removeViewSafely)
+        rectangleSelectorView = null
+        setupTranslationOverlay(panelArea)
+        updateState(OverlayState.ACTIVE)
+        startCaptureLoop()
+    }
+
+    private fun showAreaSelector(
+        title: String,
+        initialArea: ScreenArea,
+        onConfirm: (ScreenArea) -> Unit,
+    ) {
+        rectangleSelectorView?.let(::removeViewSafely)
         rectangleSelectorView = RectangleSelectorView(
             context = this,
             windowManager = windowManager,
-            onConfirm = { x, y, w, h ->
-                selectedArea = intArrayOf(x, y, w, h)
-                consecutiveBlankFrames = 0
-                translateManager.resetLastText()
-
-                DebugStore.selectedAreaX.value = x
-                DebugStore.selectedAreaY.value = y
-                DebugStore.selectedAreaW.value = w
-                DebugStore.selectedAreaH.value = h
-
-                rectangleSelectorView?.let(::removeViewSafely)
-                rectangleSelectorView = null
-
-                // Overlay uses ORIGINAL portrait coords (same space as the selector).
-                setupTranslationOverlay(x, y, w, h)
-
-                updateState(OverlayState.ACTIVE)
-                startCaptureLoop()
+            title = title,
+            onConfirm = { x, y, width, height ->
+                onConfirm(ScreenArea(x, y, width, height))
             },
-            onCancel = { cancelSelectionMode() }
+            onCancel = ::cancelSelectionMode,
+            onWindowError = ::handleOverlayWindowError,
         )
-
-        val bounds = displayBounds()
-        val horizontalMargin = dpToPx(24)
-        val selectorWidth = (bounds.width() * 0.65f).toInt()
-            .coerceIn(dpToPx(200), (bounds.width() - horizontalMargin * 2).coerceAtLeast(dpToPx(200)))
-        val selectorHeight = (bounds.height() * 0.25f).toInt()
-            .coerceIn(dpToPx(100), (bounds.height() - horizontalMargin * 2).coerceAtLeast(dpToPx(100)))
         val rectParams = WindowManager.LayoutParams(
-            selectorWidth, selectorHeight,
+            initialArea.width,
+            initialArea.height,
             getLayoutFlag(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = ((bounds.width() - selectorWidth) / 2).coerceAtLeast(0)
-            y = ((bounds.height() - selectorHeight) / 2).coerceAtLeast(0)
+            x = initialArea.x
+            y = initialArea.y
         }
         rectangleSelectorView?.params = rectParams
         rectangleSelectorView?.let { addViewSafely(it, rectParams) }
@@ -209,20 +353,33 @@ class OverlayService : Service() {
     private fun cancelSelectionMode() {
         rectangleSelectorView?.let(::removeViewSafely)
         rectangleSelectorView = null
-        updateState(if (selectedArea != null) OverlayState.PAUSED else OverlayState.IDLE)
+        updateState(
+            if (selectedArea != null && translationPanelArea != null) {
+                OverlayState.PAUSED
+            } else {
+                OverlayState.IDLE
+            },
+        )
     }
 
-    private fun setupTranslationOverlay(x: Int, y: Int, w: Int, h: Int) {
+    private fun setupTranslationOverlay(area: ScreenArea) {
         translationOverlayView?.let(::removeViewSafely)
         translationOverlayView = TranslationOverlayView(this)
 
-        // Overlay windows are composited in the game's landscape frame, so convert
-        // the portrait selection the same way the capture crop is converted.
-        val o = toOverlayRect(intArrayOf(x, y, w, h))
+        // The selector and translation window are both WindowManager overlays, so
+        // their coordinates already share the same space. Only the bitmap crop may
+        // need a rotation transform.
+        val bounds = displayBounds()
+        val safeX = area.x.coerceIn(0, (bounds.width() - 1).coerceAtLeast(0))
+        val safeY = area.y.coerceIn(0, (bounds.height() - 1).coerceAtLeast(0))
+        val safeWidth = area.width.coerceAtLeast(1)
+            .coerceAtMost((bounds.width() - safeX).coerceAtLeast(1))
+        val safeHeight = area.height.coerceAtLeast(1)
+            .coerceAtMost((bounds.height() - safeY).coerceAtLeast(1))
 
         val transParams = WindowManager.LayoutParams(
-            o[2],
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            safeWidth,
+            safeHeight,
             getLayoutFlag(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
@@ -232,10 +389,10 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
        ).apply {
             gravity = Gravity.TOP or Gravity.START
-            this.x = o[0]
-            this.y = o[1]
+            this.x = safeX
+            this.y = safeY
+            alpha = TOUCH_THROUGH_ALPHA
         }
-        translationOverlayParams = transParams
         translationOverlayView?.let { addViewSafely(it, transParams) }
     }
 
@@ -243,78 +400,334 @@ class OverlayService : Service() {
         if (captureJob?.isActive == true) return
 
         captureJob = scope.launch(Dispatchers.Default) {
-            // Beri waktu user pindah ke game
-            delay(2000)
+            // Give Android time to put the game back in front.
+            delay(CaptureCadencePolicy.INITIAL_SETTLE_MS)
 
             while (isActive) {
-                if (currentState == OverlayState.ACTIVE) {
-                    screenCaptureManager.refreshDisplayGeometry()
-                    // Map the portrait selection into the landscape bitmap space.
-                    val area = selectedArea?.let { toBitmapRect(it) }
-                    if (area != null && area[2] > 0 && area[3] > 0) {
-                        try {
-                            val x = area[0]
-                            val y = area[1]
-                            val w = area[2]
-                            val h = area[3]
+                if (!PermissionHelper.hasOverlayPermission(this@OverlayService)) {
+                    withContext(Dispatchers.Main.immediate) {
+                        handleOverlayPermissionLost()
+                    }
+                    break
+                }
 
-                            DebugStore.captureStatus.value = "CAPTURING..."
-                            val bitmap = screenCaptureManager.captureRect(x, y, w, h)
-
-                            if (bitmap != null) {
-                                DebugStore.captureStatus.value = "OK"
-                                DebugStore.bitmapCaptured.value = true
-                                DebugStore.lastBitmap.value = bitmap
-
-                                val text = ocrManager.extractText(bitmap)
-                                DebugStore.ocrRawText.value = text
-                                DebugStore.ocrTextLength.value = text.length
-
-                                if (text.isNotBlank()) {
-                                    consecutiveBlankFrames = 0
-                                    if (DebugStore.enableTranslation.value) {
-                                        val translated = translateManager.translate(text)
-                                        DebugStore.translationResult.value = translated ?: "NULL"
-                                        withContext(Dispatchers.Main) {
-                                            translationOverlayView?.setText(
-                                                if (!translated.isNullOrBlank()) translated else ""
-                                            )
-                                        }
-                                    } else {
-                                        DebugStore.translationResult.value = "SKIPPED (OCR ONLY)"
-                                        withContext(Dispatchers.Main) {
-                                            translationOverlayView?.setText(text)
-                                        }
-                                    }
-                                } else {
-                                    consecutiveBlankFrames++
-                                    if (consecutiveBlankFrames >= 2) {
-                                        DebugStore.translationResult.value = ""
-                                        withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
-                                    }
-                                }
-                            } else {
-                                DebugStore.captureStatus.value = "FAIL"
-                                DebugStore.bitmapCaptured.value = false
+                if (DebugStore.isActivityVisible) {
+                    if (!activityWasVisible) {
+                        activityWasVisible = true
+                        withContext(Dispatchers.Main.immediate) {
+                            invalidateCaptureWork(keepSelection = true)
+                            screenCaptureManager.resetBitmap()
+                            rectangleSelectorView?.let(::removeViewSafely)
+                            rectangleSelectorView = null
+                            if (currentState == OverlayState.SELECTING) {
+                                updateState(
+                                    if (selectedArea != null) OverlayState.PAUSED
+                                    else OverlayState.IDLE,
+                                )
                             }
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            DebugStore.logError(e)
-                            e.printStackTrace()
+                            translationOverlayView?.setCaptureHidden(true)
                         }
                     }
-                } else {
-                    withContext(Dispatchers.Main) { translationOverlayView?.setText("") }
+                    DebugStore.captureStatus.value = "PAUSED (APP OPEN)"
+                    delay(250)
+                    continue
                 }
-                delay(1500)
+
+                if (activityWasVisible) {
+                    activityWasVisible = false
+                    DebugStore.captureStatus.value = "WAITING FOR GAME"
+                    delay(APP_SWITCH_SETTLE_MS)
+                    if (DebugStore.isActivityVisible) continue
+                }
+
+                val selection = selectedArea
+                if (currentState == OverlayState.ACTIVE && selection != null) {
+                    val attempt = launch {
+                        try {
+                            captureSelectedArea(selection)
+                        } catch (failure: CancellationException) {
+                            throw failure
+                        } catch (failure: Exception) {
+                            withContext(Dispatchers.Main.immediate) {
+                                if (isCurrentSelection(selection)) {
+                                    DebugStore.captureStatus.value = "ERROR"
+                                    DebugStore.logError(failure)
+                                }
+                            }
+                        }
+                    }
+                    captureAttemptJob = attempt
+                    try {
+                        while (attempt.isActive) {
+                            if (DebugStore.isActivityVisible ||
+                                currentState != OverlayState.ACTIVE ||
+                                selectedArea?.epoch != selection.epoch
+                            ) {
+                                attempt.cancel()
+                            }
+                            delay(25)
+                        }
+                        attempt.join()
+                    } finally {
+                        if (captureAttemptJob === attempt) {
+                            captureAttemptJob = null
+                        }
+                    }
+                    waitForNextCapture(selection.epoch)
+                } else {
+                    delay(250)
+                }
+            }
+        }
+    }
+
+    private suspend fun waitForNextCapture(epoch: Long) {
+        val delayMs = nextCaptureDelayMs
+        withTimeoutOrNull(delayMs) {
+            while (currentState == OverlayState.ACTIVE &&
+                selectedArea?.epoch == epoch &&
+                !DebugStore.isActivityVisible
+            ) {
+                delay(50)
+            }
+        }
+    }
+
+    private suspend fun captureSelectedArea(selection: SelectedArea) {
+        if (!isCurrentSelection(selection)) return
+
+        var nextOverlayRegions: List<OverlayTextRegion>? = null
+        try {
+            if (!isCurrentSelection(selection)) return
+            val request = screenCaptureManager.requestFreshFrames(count = 1)
+            if (request == null) {
+                updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "WAITING FOR FRAME"
+                }
+                return
+            }
+
+            if (!awaitFrameRequest(request, selection, FRAME_WAIT_TIMEOUT_MS)) {
+                updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "WAITING FOR CLEAN FRAME"
+                }
+                return
+            }
+
+            if (!isCurrentSelection(selection)) return
+            val (bitmapWidth, bitmapHeight) = screenCaptureManager.bitmapSize() ?: run {
+                updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "WAITING FOR FRAME"
+                }
+                return
+            }
+            if (!updateIfCurrent(selection) {
+                    DebugStore.captureFrameWidth.value = bitmapWidth
+                    DebugStore.captureFrameHeight.value = bitmapHeight
+                }
+            ) return
+            val area = toBitmapRect(selection, bitmapWidth, bitmapHeight)
+
+            if (!updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "CAPTURING..."
+                }
+            ) return
+
+            val bitmap = screenCaptureManager.captureRect(area[0], area[1], area[2], area[3])
+            if (bitmap == null) {
+                updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "FAIL"
+                    DebugStore.bitmapCaptured.value = false
+                }
+                return
+            }
+
+            if (!updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "OCR..."
+                }
+            ) return
+
+            val ocr = withTimeoutOrNull(OCR_TIMEOUT_MS) {
+                ocrManager.extractText(bitmap)
+            }
+            if (ocr == null) {
+                updateIfCurrent(selection) {
+                    DebugStore.captureStatus.value = "OCR TIMEOUT"
+                    DebugStore.bitmapCaptured.value = false
+                }
+                return
+            }
+
+            val text = ocr.text
+            var regionsToTranslate: List<OcrTextRegion>? = null
+            if (!updateIfCurrent(selection) {
+                    DebugStore.bitmapCaptured.value = true
+                    DebugStore.lastBitmap.value = bitmap
+                    DebugStore.ocrRawText.value = text
+                    DebugStore.ocrTextLength.value = text.length
+                    DebugStore.detectedBlocks.value = ocr.blockCount
+                    DebugStore.detectedLines.value = ocr.lineCount
+
+                    val decision = ocrStabilityTracker.observe(ocr.regions)
+                    nextCaptureDelayMs = CaptureCadencePolicy.delayAfter(decision)
+                    when (decision) {
+                        OcrUpdateDecision.WAITING_FOR_STABLE_TEXT -> {
+                            DebugStore.captureStatus.value = "STABILIZING OCR..."
+                        }
+                        OcrUpdateDecision.UNCHANGED -> {
+                            DebugStore.captureStatus.value = "UNCHANGED"
+                        }
+                        OcrUpdateDecision.CLEARED -> {
+                            DebugStore.captureStatus.value = "NO TEXT"
+                            DebugStore.translationResult.value = ""
+                            nextOverlayRegions = emptyList()
+                        }
+                        OcrUpdateDecision.CHANGED -> {
+                            if (DebugStore.enableTranslation.value) {
+                                regionsToTranslate = ocr.regions
+                                DebugStore.captureStatus.value = "TRANSLATING..."
+                            } else {
+                                DebugStore.translationResult.value = "SKIPPED (OCR ONLY)"
+                                nextOverlayRegions = ocr.regions.map { region ->
+                                    OverlayTextRegionMapper.map(
+                                        source = region,
+                                        translatedText = region.text,
+                                        imageWidth = bitmap.width,
+                                        imageHeight = bitmap.height,
+                                    )
+                                }
+                                DebugStore.captureStatus.value = "OK"
+                            }
+                        }
+                    }
+                }
+            ) return
+
+            val stableRegions = regionsToTranslate
+            if (stableRegions != null) {
+                val translatedRegions = withTimeoutOrNull(TRANSLATION_TIMEOUT_MS) {
+                    val mappedRegions = stableRegions.map { region ->
+                        val translatedText =
+                            translateManager.translate(region.text) ?: region.text
+                        OverlayTextRegionMapper.map(
+                            source = region,
+                            translatedText = translatedText,
+                            imageWidth = bitmap.width,
+                            imageHeight = bitmap.height,
+                        )
+                    }
+                    mappedRegions
+                }
+                if (translatedRegions == null) {
+                    ocrStabilityTracker.reset()
+                    nextCaptureDelayMs = CaptureCadencePolicy.STABILITY_RECHECK_MS
+                    updateIfCurrent(selection) {
+                        DebugStore.captureStatus.value = "TRANSLATION TIMEOUT"
+                        DebugStore.translationResult.value = "TIMEOUT"
+                    }
+                    return
+                }
+                updateIfCurrent(selection) {
+                    DebugStore.translationResult.value =
+                        translatedRegions.joinToString(separator = "\n") { it.text }
+                    nextOverlayRegions = translatedRegions
+                    DebugStore.captureStatus.value = "OK"
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            ocrStabilityTracker.reset()
+            nextCaptureDelayMs = CaptureCadencePolicy.NORMAL_INTERVAL_MS
+            withContext(Dispatchers.Main.immediate) {
+                if (isCurrentSelection(selection)) {
+                    DebugStore.captureStatus.value = "ERROR"
+                    DebugStore.logError(e)
+                }
+            }
+        } finally {
+            // ML Kit Tasks are not cancellable at the native layer. Do not recycle
+            // this bitmap here: a timed-out task may still be reading it.
+            restoreTranslationOverlay(selection, nextOverlayRegions)
+        }
+    }
+
+    private suspend fun awaitFrameRequest(
+        request: FrameRequest,
+        selection: SelectedArea,
+        timeoutMs: Long,
+    ): Boolean {
+        return try {
+            val reachedTarget = withTimeoutOrNull(timeoutMs) {
+                while (screenCaptureManager.frameSequence() < request.target) {
+                    if (!isCurrentSelection(selection)) {
+                        return@withTimeoutOrNull false
+                    }
+                    delay(16)
+                }
+                true
+            }
+            when {
+                reachedTarget == true -> true
+                !isCurrentSelection(selection) -> false
+                else -> screenCaptureManager.frameSequence() > request.baseline
+            }
+        } finally {
+            screenCaptureManager.cancelPendingFrameRequests()
+        }
+    }
+
+    private suspend fun restoreTranslationOverlay(
+        selection: SelectedArea,
+        nextRegions: List<OverlayTextRegion>?,
+    ) {
+        withContext(Dispatchers.Main.immediate) {
+            if (!ownsSelection(selection)) return@withContext
+            val overlay = translationOverlayView ?: return@withContext
+            when {
+                DebugStore.isActivityVisible -> overlay.setCaptureHidden(true)
+                currentState == OverlayState.ACTIVE -> {
+                    nextRegions?.let(overlay::setRegions)
+                    overlay.setCaptureHidden(false)
+                }
+                else -> {
+                    overlay.setRegions(emptyList())
+                    overlay.setCaptureHidden(false)
+                }
+            }
+        }
+    }
+
+    private fun ownsSelection(selection: SelectedArea): Boolean {
+        return captureEpoch.matches(selection.epoch) &&
+            selectedArea?.epoch == selection.epoch
+    }
+
+    private fun isCurrentSelection(selection: SelectedArea): Boolean {
+        return ownsSelection(selection) &&
+            currentState == OverlayState.ACTIVE &&
+            !DebugStore.isActivityVisible
+    }
+
+    private suspend fun updateIfCurrent(
+        selection: SelectedArea,
+        update: () -> Unit,
+    ): Boolean {
+        return withContext(Dispatchers.Main.immediate) {
+            if (!isCurrentSelection(selection)) {
+                false
+            } else {
+                update()
+                true
             }
         }
     }
 
     override fun onDestroy() {
-        super.onDestroy()
         DebugStore.serviceState.value = "STOPPED"
+        captureEpoch.next()
+        screenCaptureManager.cancelPendingFrameRequests()
+        captureAttemptJob?.cancel()
         captureJob?.cancel()
         scope.cancel()
 
@@ -325,76 +738,59 @@ class OverlayService : Service() {
         translationOverlayView = null
         controlBarView = null
 
-        screenCaptureManager.stop()
-        ocrManager.close()
-        translateManager.close()
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        try {
+            screenCaptureManager.stop()
+        } catch (failure: RuntimeException) {
+            DebugStore.logError(failure)
+        }
+        try {
+            ocrManager.close()
+        } catch (failure: RuntimeException) {
+            DebugStore.logError(failure)
+        }
+        try {
+            translateManager.close()
+        } catch (failure: RuntimeException) {
+            DebugStore.logError(failure)
+        }
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } catch (failure: RuntimeException) {
+            DebugStore.logError(failure)
+        }
+        super.onDestroy()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        invalidateCaptureWork()
         screenCaptureManager.refreshDisplayGeometry()
-        if (currentState == OverlayState.SELECTING) {
-            cancelSelectionMode()
-        } else {
-            selectedArea?.let { setupTranslationOverlay(it[0], it[1], it[2], it[3]) }
+        rectangleSelectorView?.let(::removeViewSafely)
+        rectangleSelectorView = null
+        removeTranslationOverlay()
+        controlBarView?.let(::removeViewSafely)
+        controlBarView = null
+        setupControlBar()
+        updateState(if (selectedArea != null) OverlayState.PAUSED else OverlayState.IDLE)
+    }
+
+    private fun toBitmapRect(
+        selection: SelectedArea,
+        bitmapWidth: Int,
+        bitmapHeight: Int,
+    ): IntArray {
+        val quarterTurn = when (selection.displayRotation) {
+            Surface.ROTATION_90 -> QuarterTurn.CLOCKWISE
+            Surface.ROTATION_270 -> QuarterTurn.COUNTER_CLOCKWISE
+            else -> null
         }
-    }
-
-    /** Device portrait dimensions as (width, height); system stays portrait. */
-    private fun portraitSize(): Pair<Float, Float> {
-        val bounds = displayBounds()
-        return Pair(
-            minOf(bounds.width(), bounds.height()).toFloat(),
-            maxOf(bounds.width(), bounds.height()).toFloat(),
-        )
-    }
-
-    /**
-     * Rotate a rect from PORTRAIT window space into the force-landscape frame
-     * (size ph x pw). Used by BOTH the overlay placement and the capture crop so
-     * the two can never diverge. Result is [x, y, w, h] as floats.
-     *
-     * Default is 90° CCW, matching the on-device measurement
-     * (lx = y, ly = portraitWidth - x - w). If captures/overlay land 180°-off or
-     * mirrored, flip CLOCKWISE to true.
-     */
-    private fun rotatePortraitToLandscape(a: IntArray): FloatArray {
-        val (pw, ph) = portraitSize()
-        val x = a[0]; val y = a[1]; val w = a[2]; val h = a[3]
-        val rx: Float; val ry: Float
-        if (CLOCKWISE) {
-            rx = ph - (y + h)
-            ry = x.toFloat()
-        } else {
-            rx = y.toFloat()
-            ry = pw - (x + w)
-        }
-        return floatArrayOf(rx, ry, h.toFloat(), w.toFloat())
-    }
-
-    /** Overlay window position in the landscape frame (no scaling — window space). */
-    private fun toOverlayRect(a: IntArray): IntArray {
-        val r = rotatePortraitToLandscape(a)
-        return intArrayOf(r[0].toInt(), r[1].toInt(), r[2].toInt(), r[3].toInt())
-    }
-
-    /**
-     * Capture crop in ACTUAL bitmap pixels: same rotation as the overlay, then
-     * scaled from the portrait-derived landscape frame (ph x pw) to the real
-     * bitmap size in case they differ (nav bar, rounding, etc.).
-     */
-    private fun toBitmapRect(a: IntArray): IntArray {
-        val (bmpW, bmpH) = screenCaptureManager.bitmapSize() ?: return a
-        val (pw, ph) = portraitSize()
-        val r = rotatePortraitToLandscape(a)
-        val sx = bmpW / ph
-        val sy = bmpH / pw
-        return intArrayOf(
-            (r[0] * sx).toInt(),
-            (r[1] * sy).toInt(),
-            (r[2] * sx).toInt(),
-            (r[3] * sy).toInt()
+        return ScreenRegionMapper.map(
+            rect = selection.asRect(),
+            sourceWidth = selection.displayWidth,
+            sourceHeight = selection.displayHeight,
+            targetWidth = bitmapWidth,
+            targetHeight = bitmapHeight,
+            quarterTurn = quarterTurn,
         )
     }
 
@@ -443,13 +839,41 @@ class OverlayService : Service() {
 
     private fun reselectArea() {
         if (currentState == OverlayState.SELECTING) return
-        translationOverlayView?.setText("")
         startSelectionMode()
+    }
+
+    private fun invalidateCaptureWork(keepSelection: Boolean = false) {
+        val epoch = captureEpoch.next()
+        if (keepSelection) {
+            selectedArea = selectedArea?.copy(epoch = epoch)
+        }
+        ocrStabilityTracker.reset()
+        translateManager.resetLastText()
+        nextCaptureDelayMs = CaptureCadencePolicy.NORMAL_INTERVAL_MS
+        captureAttemptJob?.cancel()
+        screenCaptureManager.cancelPendingFrameRequests()
+    }
+
+    private fun removeTranslationOverlay() {
+        translationOverlayView?.let(::removeViewSafely)
+        translationOverlayView = null
+    }
+
+    private fun handleOverlayPermissionLost() {
+        DebugStore.captureStatus.value = "STOPPED"
+        DebugStore.logMessage("Izin tampil di atas aplikasi lain telah dicabut.")
+        stopSelf()
+    }
+
+    private fun handleOverlayWindowError(failure: Throwable) {
+        DebugStore.captureStatus.value = "STOPPED"
+        DebugStore.logError(failure)
+        stopSelf()
     }
 
     private fun displayBounds(): Rect {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            windowManager.maximumWindowMetrics.bounds
+            windowManager.currentWindowMetrics.bounds
         } else {
             @Suppress("DEPRECATION")
             val metrics = android.util.DisplayMetrics().also {
@@ -459,14 +883,23 @@ class OverlayService : Service() {
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun displayRotation(): Int = windowManager.defaultDisplay.rotation
+
+    private fun rotationDegrees(rotation: Int): Int = when (rotation) {
+        Surface.ROTATION_90 -> 90
+        Surface.ROTATION_180 -> 180
+        Surface.ROTATION_270 -> 270
+        else -> 0
+    }
+
     private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
 
     private fun addViewSafely(view: View, params: WindowManager.LayoutParams) {
         try {
             windowManager.addView(view, params)
         } catch (e: Exception) {
-            DebugStore.logError(e)
-            stopSelf()
+            handleOverlayWindowError(e)
         }
     }
 
@@ -475,6 +908,8 @@ class OverlayService : Service() {
             if (view.isAttachedToWindow) windowManager.removeView(view)
         } catch (e: IllegalArgumentException) {
             // The system may already have detached overlay windows during teardown.
+        } catch (e: RuntimeException) {
+            DebugStore.logError(e)
         }
     }
 }
