@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -47,35 +48,22 @@ internal class TranslationOverlayView(context: Context) : FrameLayout(context) {
                 val isVisible by visibleState
 
                 if (isVisible && regions.isNotEmpty()) {
-                    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-                        regions.forEach { region ->
-                            val bounds = region.displayBounds
-                            val x = maxWidth * bounds.left
-                            val y = maxHeight * bounds.top
-                            val boxWidth = maxWidth * bounds.width
-                            val boxHeight = maxHeight * bounds.height
-
-                            Box(
-                                modifier = Modifier
-                                    .offset(x = x, y = y)
-                                    .size(
-                                        width = boxWidth,
-                                        height = boxHeight,
-                                    )
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(Color(0xE6000000))
-                                    .padding(horizontal = 6.dp, vertical = 3.dp),
-                            ) {
-                                Text(
-                                    text = region.text,
-                                    color = Color.White,
-                                    fontSize = 13.sp,
-                                    lineHeight = 16.sp,
-                                    maxLines = 3,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                        }
+                    Box(
+                        contentAlignment = Alignment.CenterStart,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xE6000000))
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                    ) {
+                        Text(
+                            text = regions.joinToString(separator = "\n") { it.text },
+                            color = Color.White,
+                            fontSize = 15.sp,
+                            lineHeight = 19.sp,
+                            maxLines = 10,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
                 }
             }
@@ -92,14 +80,6 @@ internal class TranslationOverlayView(context: Context) : FrameLayout(context) {
             regionsState.value = visibleRegions
         }
         visibleState.value = visibleRegions.isNotEmpty()
-    }
-
-    fun hideForCapture(): Boolean {
-        val wasVisible = visibility == View.VISIBLE && visibleState.value
-        if (wasVisible) {
-            visibility = View.INVISIBLE
-        }
-        return wasVisible
     }
 
     fun setCaptureHidden(hidden: Boolean) {

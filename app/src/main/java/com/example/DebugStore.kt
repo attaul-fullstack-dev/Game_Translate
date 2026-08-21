@@ -27,6 +27,10 @@ object DebugStore {
     var selectedAreaY = mutableStateOf(0)
     var selectedAreaW = mutableStateOf(0)
     var selectedAreaH = mutableStateOf(0)
+    var translationPanelX = mutableStateOf(0)
+    var translationPanelY = mutableStateOf(0)
+    var translationPanelW = mutableStateOf(0)
+    var translationPanelH = mutableStateOf(0)
     var selectedDisplayWidth = mutableStateOf(0)
     var selectedDisplayHeight = mutableStateOf(0)
     var selectedDisplayRotation = mutableStateOf(0)
@@ -50,6 +54,10 @@ object DebugStore {
         selectedAreaY.value = 0
         selectedAreaW.value = 0
         selectedAreaH.value = 0
+        translationPanelX.value = 0
+        translationPanelY.value = 0
+        translationPanelW.value = 0
+        translationPanelH.value = 0
         selectedDisplayWidth.value = 0
         selectedDisplayHeight.value = 0
         selectedDisplayRotation.value = 0

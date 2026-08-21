@@ -1,7 +1,6 @@
 package com.example
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class OverlayTextRegionMapperTest {
@@ -51,47 +50,4 @@ class OverlayTextRegionMapperTest {
         assertEquals(1f, mapped.sourceBounds.width, 0.0001f)
         assertEquals(1f, mapped.sourceBounds.height, 0.0001f)
     }
-
-    @Test
-    fun `translated boxes stay centered over their source text`() {
-        val regions = listOf(
-            overlayRegion(
-                text = "Bermain",
-                sourceBounds = NormalizedBounds(0.2f, 0.2f, 0.45f, 0.3f),
-            ),
-            overlayRegion(
-                text = "Bantuan dan Opsi",
-                sourceBounds = NormalizedBounds(0.2f, 0.5f, 0.55f, 0.6f),
-            ),
-        )
-
-        val placed = OverlayPlacementEngine.place(
-            regions = regions,
-            minimumWidthFraction = 0.2f,
-            minimumHeightFraction = 0.1f,
-        )
-        placed.zip(regions).forEach { (result, original) ->
-            assertTrue(result.displayBounds.left >= 0f)
-            assertTrue(result.displayBounds.top >= 0f)
-            assertTrue(result.displayBounds.right <= 1f)
-            assertTrue(result.displayBounds.bottom <= 1f)
-            assertTrue(
-                result.displayBounds.contains(
-                    original.sourceBounds.centerX,
-                    original.sourceBounds.centerY,
-                ),
-            )
-            assertTrue(
-                result.displayBounds.intersectionArea(original.sourceBounds) > 0f,
-            )
-        }
-    }
-
-    private fun overlayRegion(
-        text: String,
-        sourceBounds: NormalizedBounds,
-    ) = OverlayTextRegion(
-        text = text,
-        sourceBounds = sourceBounds,
-    )
 }

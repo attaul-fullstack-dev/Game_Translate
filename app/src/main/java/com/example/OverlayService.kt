@@ -16,6 +16,7 @@ import android.view.Gravity
 import android.view.Surface
 import android.view.View
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.IntentCompat
 import kotlinx.coroutines.*
@@ -29,24 +30,32 @@ class OverlayService : Service() {
 
         private const val TOUCH_THROUGH_ALPHA = 0.79f
         private const val FRAME_WAIT_TIMEOUT_MS = 1_250L
-        private const val OVERLAY_HIDDEN_FRAME_WAIT_TIMEOUT_MS = 150L
         private const val OCR_TIMEOUT_MS = 5_000L
         private const val TRANSLATION_TIMEOUT_MS = 8_000L
         private const val APP_SWITCH_SETTLE_MS = 500L
     }
 
     private data class SelectedArea(
-        val x: Int,
-        val y: Int,
-        val width: Int,
-        val height: Int,
+        val area: ScreenArea,
         val displayWidth: Int,
         val displayHeight: Int,
         val displayRotation: Int,
         val epoch: Long,
     ) {
+        val x: Int get() = area.x
+        val y: Int get() = area.y
+        val width: Int get() = area.width
+        val height: Int get() = area.height
+
         fun asRect(): IntArray = intArrayOf(x, y, width, height)
     }
+
+    private data class PendingOcrSelection(
+        val area: ScreenArea,
+        val displayWidth: Int,
+        val displayHeight: Int,
+        val displayRotation: Int,
+    )
 
     private lateinit var windowManager: WindowManager
     private lateinit var screenCaptureManager: ScreenCaptureManager
@@ -70,6 +79,7 @@ class OverlayService : Service() {
     private var currentState = OverlayState.IDLE
     @Volatile
     private var selectedArea: SelectedArea? = null
+    private var translationPanelArea: ScreenArea? = null
     private var activityWasVisible = false
 
     override fun onCreate() {
@@ -193,56 +203,138 @@ class OverlayService : Service() {
         removeTranslationOverlay()
         updateState(OverlayState.SELECTING)
 
+        val bounds = displayBounds()
+        val margin = dpToPx(24)
+        val availableWidth = (bounds.width() - margin * 2).coerceAtLeast(1)
+        val availableHeight = (bounds.height() - margin * 2).coerceAtLeast(1)
+        val minimumWidth = dpToPx(200).coerceAtMost(availableWidth)
+        val minimumHeight = dpToPx(100).coerceAtMost(availableHeight)
+        val selectorWidth = (bounds.width() * 0.75f).toInt()
+            .coerceIn(minimumWidth, availableWidth)
+        val selectorHeight = (bounds.height() * 0.28f).toInt()
+            .coerceIn(minimumHeight, availableHeight)
+        val initialArea = ScreenArea(
+            x = ((bounds.width() - selectorWidth) / 2).coerceAtLeast(0),
+            y = ((bounds.height() - selectorHeight) / 2).coerceAtLeast(0),
+            width = selectorWidth,
+            height = selectorHeight,
+        )
+        showAreaSelector(
+            title = "1/2  Pilih area teks game (OCR)",
+            initialArea = initialArea,
+            onConfirm = ::confirmOcrArea,
+        )
+    }
+
+    private fun confirmOcrArea(area: ScreenArea) {
+        val bounds = displayBounds()
+        val pending = PendingOcrSelection(
+            area = area,
+            displayWidth = bounds.width(),
+            displayHeight = bounds.height(),
+            displayRotation = displayRotation(),
+        )
+        val panelArea = ScreenAreaSelectionPolicy.defaultTranslationPanel(
+            ocrArea = area,
+            displayWidth = bounds.width(),
+            displayHeight = bounds.height(),
+            minimumWidth = dpToPx(240),
+            minimumHeight = dpToPx(96),
+            margin = dpToPx(16),
+        )
+        showAreaSelector(
+            title = "2/2  Pilih panel hasil terjemahan",
+            initialArea = panelArea,
+            onConfirm = { confirmedPanel ->
+                completeAreaSelection(pending, confirmedPanel)
+            },
+        )
+    }
+
+    private fun completeAreaSelection(
+        pending: PendingOcrSelection,
+        panelArea: ScreenArea,
+    ) {
+        val bounds = displayBounds()
+        val rotation = displayRotation()
+        if (bounds.width() != pending.displayWidth ||
+            bounds.height() != pending.displayHeight ||
+            rotation != pending.displayRotation
+        ) {
+            Toast.makeText(
+                this,
+                "Orientasi berubah. Pilih ulang kedua area.",
+                Toast.LENGTH_LONG,
+            ).show()
+            startSelectionMode()
+            return
+        }
+        if (!ScreenAreaSelectionPolicy.isInsideDisplay(
+                area = panelArea,
+                displayWidth = bounds.width(),
+                displayHeight = bounds.height(),
+            ) || ScreenAreaSelectionPolicy.overlaps(pending.area, panelArea)
+        ) {
+            Toast.makeText(
+                this,
+                "Panel terjemahan tidak boleh menutupi area OCR.",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+
+        val epoch = captureEpoch.next()
+        val area = SelectedArea(
+            area = pending.area,
+            displayWidth = pending.displayWidth,
+            displayHeight = pending.displayHeight,
+            displayRotation = pending.displayRotation,
+            epoch = epoch,
+        )
+        selectedArea = area
+        translationPanelArea = panelArea
+        ocrStabilityTracker.reset()
+        translateManager.resetLastText()
+        nextCaptureDelayMs = CaptureCadencePolicy.NORMAL_INTERVAL_MS
+
+        DebugStore.selectedAreaX.value = area.x
+        DebugStore.selectedAreaY.value = area.y
+        DebugStore.selectedAreaW.value = area.width
+        DebugStore.selectedAreaH.value = area.height
+        DebugStore.translationPanelX.value = panelArea.x
+        DebugStore.translationPanelY.value = panelArea.y
+        DebugStore.translationPanelW.value = panelArea.width
+        DebugStore.translationPanelH.value = panelArea.height
+        DebugStore.selectedDisplayWidth.value = pending.displayWidth
+        DebugStore.selectedDisplayHeight.value = pending.displayHeight
+        DebugStore.selectedDisplayRotation.value = rotationDegrees(pending.displayRotation)
+
+        rectangleSelectorView?.let(::removeViewSafely)
+        rectangleSelectorView = null
+        setupTranslationOverlay(panelArea)
+        updateState(OverlayState.ACTIVE)
+        startCaptureLoop()
+    }
+
+    private fun showAreaSelector(
+        title: String,
+        initialArea: ScreenArea,
+        onConfirm: (ScreenArea) -> Unit,
+    ) {
+        rectangleSelectorView?.let(::removeViewSafely)
         rectangleSelectorView = RectangleSelectorView(
             context = this,
             windowManager = windowManager,
-            onConfirm = { x, y, w, h ->
-                val bounds = displayBounds()
-                val rotation = displayRotation()
-                val epoch = captureEpoch.next()
-                val area = SelectedArea(
-                    x = x,
-                    y = y,
-                    width = w,
-                    height = h,
-                    displayWidth = bounds.width(),
-                    displayHeight = bounds.height(),
-                    displayRotation = rotation,
-                    epoch = epoch,
-                )
-                selectedArea = area
-                ocrStabilityTracker.reset()
-                translateManager.resetLastText()
-                nextCaptureDelayMs = CaptureCadencePolicy.NORMAL_INTERVAL_MS
-
-                DebugStore.selectedAreaX.value = x
-                DebugStore.selectedAreaY.value = y
-                DebugStore.selectedAreaW.value = w
-                DebugStore.selectedAreaH.value = h
-                DebugStore.selectedDisplayWidth.value = bounds.width()
-                DebugStore.selectedDisplayHeight.value = bounds.height()
-                DebugStore.selectedDisplayRotation.value = rotationDegrees(rotation)
-
-                rectangleSelectorView?.let(::removeViewSafely)
-                rectangleSelectorView = null
-
-                setupTranslationOverlay(area)
-
-                updateState(OverlayState.ACTIVE)
-                startCaptureLoop()
+            title = title,
+            onConfirm = { x, y, width, height ->
+                onConfirm(ScreenArea(x, y, width, height))
             },
-            onCancel = { cancelSelectionMode() },
+            onCancel = ::cancelSelectionMode,
             onWindowError = ::handleOverlayWindowError,
         )
-
-        val bounds = displayBounds()
-        val horizontalMargin = dpToPx(24)
-        val selectorWidth = (bounds.width() * 0.65f).toInt()
-            .coerceIn(dpToPx(200), (bounds.width() - horizontalMargin * 2).coerceAtLeast(dpToPx(200)))
-        val selectorHeight = (bounds.height() * 0.25f).toInt()
-            .coerceIn(dpToPx(100), (bounds.height() - horizontalMargin * 2).coerceAtLeast(dpToPx(100)))
         val rectParams = WindowManager.LayoutParams(
-            selectorWidth, selectorHeight,
+            initialArea.width,
+            initialArea.height,
             getLayoutFlag(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
@@ -251,8 +343,8 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = ((bounds.width() - selectorWidth) / 2).coerceAtLeast(0)
-            y = ((bounds.height() - selectorHeight) / 2).coerceAtLeast(0)
+            x = initialArea.x
+            y = initialArea.y
         }
         rectangleSelectorView?.params = rectParams
         rectangleSelectorView?.let { addViewSafely(it, rectParams) }
@@ -261,10 +353,16 @@ class OverlayService : Service() {
     private fun cancelSelectionMode() {
         rectangleSelectorView?.let(::removeViewSafely)
         rectangleSelectorView = null
-        updateState(if (selectedArea != null) OverlayState.PAUSED else OverlayState.IDLE)
+        updateState(
+            if (selectedArea != null && translationPanelArea != null) {
+                OverlayState.PAUSED
+            } else {
+                OverlayState.IDLE
+            },
+        )
     }
 
-    private fun setupTranslationOverlay(area: SelectedArea) {
+    private fun setupTranslationOverlay(area: ScreenArea) {
         translationOverlayView?.let(::removeViewSafely)
         translationOverlayView = TranslationOverlayView(this)
 
@@ -398,14 +496,6 @@ class OverlayService : Service() {
     private suspend fun captureSelectedArea(selection: SelectedArea) {
         if (!isCurrentSelection(selection)) return
 
-        val overlayWasHidden = withContext(Dispatchers.Main.immediate) {
-            if (!isCurrentSelection(selection)) {
-                null
-            } else {
-                translationOverlayView?.hideForCapture() == true
-            }
-        } ?: return
-
         var nextOverlayRegions: List<OverlayTextRegion>? = null
         try {
             if (!isCurrentSelection(selection)) return
@@ -417,12 +507,7 @@ class OverlayService : Service() {
                 return
             }
 
-            val frameWaitTimeoutMs = if (overlayWasHidden) {
-                OVERLAY_HIDDEN_FRAME_WAIT_TIMEOUT_MS
-            } else {
-                FRAME_WAIT_TIMEOUT_MS
-            }
-            if (!awaitFrameRequest(request, selection, frameWaitTimeoutMs)) {
+            if (!awaitFrameRequest(request, selection, FRAME_WAIT_TIMEOUT_MS)) {
                 updateIfCurrent(selection) {
                     DebugStore.captureStatus.value = "WAITING FOR CLEAN FRAME"
                 }
@@ -456,10 +541,6 @@ class OverlayService : Service() {
                 }
                 return
             }
-
-            // Keep the overlay hidden only while obtaining a clean compositor
-            // frame. OCR and translation run with the previous result visible.
-            restoreTranslationOverlay(selection, null)
 
             if (!updateIfCurrent(selection) {
                     DebugStore.captureStatus.value = "OCR..."
@@ -507,17 +588,14 @@ class OverlayService : Service() {
                                 DebugStore.captureStatus.value = "TRANSLATING..."
                             } else {
                                 DebugStore.translationResult.value = "SKIPPED (OCR ONLY)"
-                                nextOverlayRegions = positionOverlayRegions(
-                                    regions = ocr.regions.map { region ->
-                                        OverlayTextRegionMapper.map(
-                                            source = region,
-                                            translatedText = region.text,
-                                            imageWidth = bitmap.width,
-                                            imageHeight = bitmap.height,
-                                        )
-                                    },
-                                    selection = selection,
-                                )
+                                nextOverlayRegions = ocr.regions.map { region ->
+                                    OverlayTextRegionMapper.map(
+                                        source = region,
+                                        translatedText = region.text,
+                                        imageWidth = bitmap.width,
+                                        imageHeight = bitmap.height,
+                                    )
+                                }
                                 DebugStore.captureStatus.value = "OK"
                             }
                         }
@@ -538,10 +616,7 @@ class OverlayService : Service() {
                             imageHeight = bitmap.height,
                         )
                     }
-                    positionOverlayRegions(
-                        regions = mappedRegions,
-                        selection = selection,
-                    )
+                    mappedRegions
                 }
                 if (translatedRegions == null) {
                     ocrStabilityTracker.reset()
@@ -621,24 +696,6 @@ class OverlayService : Service() {
                 }
             }
         }
-    }
-
-    private fun positionOverlayRegions(
-        regions: List<OverlayTextRegion>,
-        selection: SelectedArea,
-    ): List<OverlayTextRegion> {
-        val density = resources.displayMetrics.density
-        val minimumWidthFraction =
-            (72f * density / selection.width.coerceAtLeast(1))
-                .coerceIn(0.08f, 0.65f)
-        val minimumHeightFraction =
-            (24f * density / selection.height.coerceAtLeast(1))
-                .coerceIn(0.04f, 0.35f)
-        return OverlayPlacementEngine.place(
-            regions = regions,
-            minimumWidthFraction = minimumWidthFraction,
-            minimumHeightFraction = minimumHeightFraction,
-        )
     }
 
     private fun ownsSelection(selection: SelectedArea): Boolean {

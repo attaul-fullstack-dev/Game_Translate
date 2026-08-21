@@ -16,6 +16,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -26,6 +27,7 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.setViewTreeLifecycleOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
@@ -34,6 +36,7 @@ import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 class RectangleSelectorView(
     context: Context,
     private val windowManager: WindowManager,
+    private val title: String,
     private val onConfirm: (Int, Int, Int, Int) -> Unit,
     private val onCancel: () -> Unit,
     private val onWindowError: (Throwable) -> Unit,
@@ -81,6 +84,18 @@ class RectangleSelectorView(
                             cornerRadius = CornerRadius(16f, 16f)
                         )
                     }
+
+                    Text(
+                        text = title,
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(8.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color(0xE61A1A2E))
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                    )
 
                     // Action buttons top-end
                     Row(

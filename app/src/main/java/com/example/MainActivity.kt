@@ -451,6 +451,10 @@ class MainActivity : ComponentActivity() {
         val selY by DebugStore.selectedAreaY
         val selW by DebugStore.selectedAreaW
         val selH by DebugStore.selectedAreaH
+        val panelX by DebugStore.translationPanelX
+        val panelY by DebugStore.translationPanelY
+        val panelW by DebugStore.translationPanelW
+        val panelH by DebugStore.translationPanelH
         val selectedDisplayWidth by DebugStore.selectedDisplayWidth
         val selectedDisplayHeight by DebugStore.selectedDisplayHeight
         val selectedDisplayRotation by DebugStore.selectedDisplayRotation
@@ -483,7 +487,11 @@ class MainActivity : ComponentActivity() {
             DiagnosticCard("Translation Result", if (translationResult.isNotBlank()) translationResult else "NO_RESULT")
             
             Spacer(modifier = Modifier.height(8.dp))
-            DiagnosticCard("Selected Area", "X:$selX Y:$selY W:$selW H:$selH")
+            DiagnosticCard("OCR Input Area", "X:$selX Y:$selY W:$selW H:$selH")
+            DiagnosticCard(
+                "Translation Panel",
+                "X:$panelX Y:$panelY W:$panelW H:$panelH",
+            )
             DiagnosticCard(
                 "Selection Space",
                 "${selectedDisplayWidth}x$selectedDisplayHeight @ ${selectedDisplayRotation}°",
